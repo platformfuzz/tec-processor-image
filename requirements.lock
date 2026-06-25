@@ -1,0 +1,31 @@
+# requirements.lock — exact resolved versions for reproducible container builds.
+# This file records pinned (==) versions of all direct and transitive dependencies
+# installed in the tec-processor-image container. It is consumed by the Dockerfile
+# via `pip install -r requirements.lock` to ensure identical installs across builds.
+#
+# Direct dependencies: pytecgg, pyarrow, polars
+# Transitive (via pytecgg): numpy, scipy, numba, llvmlite, pymap3d, tzdata,
+#   ppigrf, requests, pandas, certifi, charset-normalizer, idna
+#
+# NOTE: boto3 is NOT included here — it is provided by the AWS Lambda runtime.
+# Regenerate this file when upgrading dependencies by resolving the full dependency
+# tree from pyproject.toml constraints on Python 3.13 (Lambda base image).
+
+# --- Direct dependencies ---
+pytecgg==1.3.0
+pyarrow==23.0.1
+polars==1.18.0
+
+# --- Transitive dependencies (via pytecgg) ---
+numpy==2.4.6
+scipy==1.18.0
+numba==0.65.1
+llvmlite==0.47.0
+pymap3d==3.2.0
+tzdata==2026.2
+ppigrf==2.1.0
+pandas==3.0.3
+requests==2.34.2
+certifi==2026.6.17
+charset-normalizer==3.4.7
+idna==3.18

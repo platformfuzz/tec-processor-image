@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+      - ".kiro/**"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+jobs:
+  publish:
+    uses: actionsforge/actions/.github/workflows/docker-image-publish.yml@main
+    with:
+      registry-type: ghcr
+      image-name: ${{ github.repository }}
+      platforms: linux/amd64
+      trivy-severity: CRITICAL
+    secrets:
+      registry-token: ${{ secrets.GITHUB_TOKEN }}

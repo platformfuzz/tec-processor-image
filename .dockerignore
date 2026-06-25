@@ -1,0 +1,5 @@
+tests/
+.github/
+.kiro/
+*.md
+.git/

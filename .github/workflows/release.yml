@@ -19,6 +19,7 @@ permissions:
   contents: read
   packages: write
   security-events: write
+  id-token: write
 
 jobs:
   publish:
@@ -28,5 +29,3 @@ jobs:
       image-name: ${{ github.repository }}
       platforms: linux/amd64
       trivy-severity: CRITICAL
-    secrets:
-      registry-token: ${{ secrets.GITHUB_TOKEN }}

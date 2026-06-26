@@ -28,5 +28,4 @@ jobs:
       registry-type: ghcr
       image-name: ${{ github.repository }}
       platforms: linux/amd64
-      trivy-vuln-type: library
       trivy-severity: CRITICAL

@@ -153,7 +153,10 @@ class TestPartialBatchFailureCompleteness:
         records, success_ids, failure_ids = data
 
         # Set up environment
-        monkeypatch.setenv("DATA_LAKE_BUCKET", "test-bucket")
+        monkeypatch.setenv("SOURCE_BUCKET", "test-source-bucket")
+        monkeypatch.setenv("SOURCE_PREFIX", "raw/rinexhourly")
+        monkeypatch.setenv("DESTINATION_BUCKET", "test-destination-bucket")
+        monkeypatch.setenv("DESTINATION_PREFIX", "processed/tec")
 
         # Set up fake AWS clients
         fake_s3 = FakeS3Client()

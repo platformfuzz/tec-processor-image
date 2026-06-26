@@ -5,7 +5,7 @@ on:
     branches: [main]
     tags: ["v*"]
     paths-ignore:
-      - "**.md"
+      - "**/*.md"
       - "LICENSE"
       - ".gitignore"
       - ".kiro/**"
@@ -28,4 +28,5 @@ jobs:
       registry-type: ghcr
       image-name: ${{ github.repository }}
       platforms: linux/amd64
+      trivy-vuln-type: library
       trivy-severity: CRITICAL

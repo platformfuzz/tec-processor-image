@@ -13,7 +13,10 @@ from moto import mock_aws
 @pytest.fixture()
 def env_vars(monkeypatch):
     """Set standard environment variables for processor tests."""
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "test-data-lake")
+    monkeypatch.setenv("SOURCE_BUCKET", "test-source-bucket")
+    monkeypatch.setenv("SOURCE_PREFIX", "raw/rinexhourly")
+    monkeypatch.setenv("DESTINATION_BUCKET", "test-destination-bucket")
+    monkeypatch.setenv("DESTINATION_PREFIX", "processed/tec")
     monkeypatch.setenv("JOBS_TABLE_NAME", "test-jobs-table")
     monkeypatch.setenv("NAV_DAY_OFFSET", "1")
     monkeypatch.setenv("SAVE_PARQUET", "true")
@@ -27,7 +30,8 @@ def mock_s3():
     """Create a mocked S3 client with the test bucket already created."""
     with mock_aws():
         client = boto3.client("s3", region_name="us-east-1")
-        client.create_bucket(Bucket="test-data-lake")
+        client.create_bucket(Bucket="test-source-bucket")
+        client.create_bucket(Bucket="test-destination-bucket")
         yield client
 
 
@@ -65,7 +69,7 @@ def sample_direct_payload():
     """Return a direct processor message payload."""
     return {
         "key": "raw/rinexhourly/2024/150/auck1500.24o",
-        "bucket": "test-data-lake",
+        "bucket": "test-source-bucket",
         "job_id": "job-abc-123",
         "trace_id": "550e8400-e29b-41d4-a716-446655440000",
         "parameters": {
@@ -85,7 +89,7 @@ def sample_s3_event_payload():
                 "eventSource": "aws:s3",
                 "eventTime": "2024-05-29T12:00:00.000Z",
                 "s3": {
-                    "bucket": {"name": "test-data-lake"},
+                    "bucket": {"name": "test-source-bucket"},
                     "object": {"key": "raw/rinexhourly/2024/150/auck1500.24o"},
                 },
             }
@@ -103,7 +107,7 @@ def sample_sns_wrapped_payload():
                 "eventSource": "aws:s3",
                 "eventTime": "2024-05-29T12:00:00.000Z",
                 "s3": {
-                    "bucket": {"name": "test-data-lake"},
+                    "bucket": {"name": "test-source-bucket"},
                     "object": {"key": "raw/rinexhourly/2024/150/auck1500.24o"},
                 },
             }

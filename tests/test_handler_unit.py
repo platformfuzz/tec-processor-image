@@ -48,6 +48,19 @@ class FakeBoto3:
         raise ValueError(service_name)
 
 
+SOURCE_BUCKET = "lake-source-bucket"
+SOURCE_PREFIX = "raw/rinexhourly"
+DESTINATION_BUCKET = "lake-destination-bucket"
+DESTINATION_PREFIX = "processed/tec"
+
+
+def _set_split_env(monkeypatch):
+    monkeypatch.setenv("SOURCE_BUCKET", SOURCE_BUCKET)
+    monkeypatch.setenv("SOURCE_PREFIX", SOURCE_PREFIX)
+    monkeypatch.setenv("DESTINATION_BUCKET", DESTINATION_BUCKET)
+    monkeypatch.setenv("DESTINATION_PREFIX", DESTINATION_PREFIX)
+
+
 def _sample_row():
     return {
         "epoch": "2024-05-29T01:00:00Z",
@@ -67,7 +80,7 @@ def _sample_row():
 def test_processor_handler_skips_s3_test_event(monkeypatch):
     fake_s3 = FakeS3Client()
     fake_ddb = FakeDdbClient()
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "lake-bucket")
+    _set_split_env(monkeypatch)
     monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
 
     event = {
@@ -95,7 +108,7 @@ def test_processor_handler_skips_s3_test_event(monkeypatch):
 def test_processor_handler_writes_parquet_on_success(monkeypatch):
     fake_s3 = FakeS3Client()
     fake_ddb = FakeDdbClient()
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "lake-bucket")
+    _set_split_env(monkeypatch)
     monkeypatch.setenv("JOBS_TABLE_NAME", "jobs-table")
     monkeypatch.setenv("NAV_DAY_OFFSET", "1")
     monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
@@ -117,9 +130,11 @@ def test_processor_handler_writes_parquet_on_success(monkeypatch):
     result = processor_handler.handler(event, None)
     assert result == {"batchItemFailures": []}
     assert len(fake_s3.gets) == 1
+    assert fake_s3.gets[0]["Bucket"] == SOURCE_BUCKET
     assert fake_s3.gets[0]["Key"] == "raw/rinexhourly/2024/150/auck1500.24o"
     assert len(fake_s3.puts) == 1
-    assert fake_s3.puts[0]["Key"] == "processed/station=auck/year=2024/doy=150/auck1500.parquet"
+    assert fake_s3.puts[0]["Bucket"] == DESTINATION_BUCKET
+    assert fake_s3.puts[0]["Key"] == "processed/tec/station=auck/year=2024/doy=150/auck1500.parquet"
     assert fake_s3.puts[0]["ContentType"] == "application/vnd.apache.parquet"
     assert fake_ddb.updates
 
@@ -127,7 +142,7 @@ def test_processor_handler_writes_parquet_on_success(monkeypatch):
 def test_processor_handler_reports_partial_failures(monkeypatch):
     fake_s3 = FakeS3Client()
     fake_ddb = FakeDdbClient()
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "lake-bucket")
+    _set_split_env(monkeypatch)
     monkeypatch.setenv("JOBS_TABLE_NAME", "jobs-table")
     monkeypatch.setenv("NAV_DAY_OFFSET", "1")
     monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
@@ -156,7 +171,7 @@ def test_processor_handler_reports_partial_failures(monkeypatch):
 def test_processor_handler_fails_when_calibration_fails(monkeypatch):
     fake_s3 = FakeS3Client()
     fake_ddb = FakeDdbClient()
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "lake-bucket")
+    _set_split_env(monkeypatch)
     monkeypatch.setenv("JOBS_TABLE_NAME", "jobs-table")
     monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
     monkeypatch.setattr(processor_handler, "download_nav_file", lambda *_args, **_kwargs: object())
@@ -192,7 +207,7 @@ def test_handler_invalid_json_body(monkeypatch):
     """
     fake_s3 = FakeS3Client()
     fake_ddb = FakeDdbClient()
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "lake-bucket")
+    _set_split_env(monkeypatch)
     monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
 
     event = {
@@ -212,13 +227,13 @@ def test_handler_invalid_json_body(monkeypatch):
 
 
 def test_handler_bucket_mismatch_rejection(monkeypatch):
-    """Record with bucket != DATA_LAKE_BUCKET should be rejected.
+    """Record with bucket != SOURCE_BUCKET should be rejected.
 
     Validates: Requirements 3.11
     """
     fake_s3 = FakeS3Client()
     fake_ddb = FakeDdbClient()
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "lake-bucket")
+    _set_split_env(monkeypatch)
     monkeypatch.setenv("JOBS_TABLE_NAME", "jobs-table")
     monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
     monkeypatch.setattr(processor_handler, "download_nav_file", lambda *_args, **_kwargs: object())
@@ -262,7 +277,7 @@ def test_handler_ddb_update_failure_isolation(monkeypatch):
 
     fake_s3 = FakeS3Client()
     failing_ddb = FailingDdbClient()
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "lake-bucket")
+    _set_split_env(monkeypatch)
     monkeypatch.setenv("JOBS_TABLE_NAME", "jobs-table")
     monkeypatch.setenv("NAV_DAY_OFFSET", "1")
     monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, failing_ddb))
@@ -291,8 +306,8 @@ def test_handler_ddb_update_failure_isolation(monkeypatch):
     assert failing_ddb.call_count >= 1
 
 
-def test_handler_data_lake_bucket_unset_raises(monkeypatch):
-    """Handler should raise RuntimeError immediately if DATA_LAKE_BUCKET is unset.
+def test_handler_source_bucket_unset_raises(monkeypatch):
+    """Handler should raise RuntimeError immediately if SOURCE_BUCKET is unset.
 
     This is a fail-fast check before processing any records.
 
@@ -300,7 +315,10 @@ def test_handler_data_lake_bucket_unset_raises(monkeypatch):
     """
     fake_s3 = FakeS3Client()
     fake_ddb = FakeDdbClient()
-    monkeypatch.delenv("DATA_LAKE_BUCKET", raising=False)
+    monkeypatch.delenv("SOURCE_BUCKET", raising=False)
+    monkeypatch.setenv("SOURCE_PREFIX", SOURCE_PREFIX)
+    monkeypatch.setenv("DESTINATION_BUCKET", DESTINATION_BUCKET)
+    monkeypatch.setenv("DESTINATION_PREFIX", DESTINATION_PREFIX)
     monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
 
     event = {
@@ -314,7 +332,7 @@ def test_handler_data_lake_bucket_unset_raises(monkeypatch):
 
     import pytest
 
-    with pytest.raises(RuntimeError, match="DATA_LAKE_BUCKET is required"):
+    with pytest.raises(RuntimeError, match="SOURCE_BUCKET is required"):
         processor_handler.handler(event, None)
 
     # No S3 operations should have been attempted
@@ -333,7 +351,7 @@ def test_handler_full_success_all_deps_mocked(monkeypatch):
     """
     fake_s3 = FakeS3Client(raw_body=b"RINEX-OBS-DATA")
     fake_ddb = FakeDdbClient()
-    monkeypatch.setenv("DATA_LAKE_BUCKET", "lake-bucket")
+    _set_split_env(monkeypatch)
     monkeypatch.setenv("JOBS_TABLE_NAME", "jobs-table")
     monkeypatch.setenv("NAV_DAY_OFFSET", "1")
 
@@ -376,13 +394,13 @@ def test_handler_full_success_all_deps_mocked(monkeypatch):
 
     # S3 get was called with the correct bucket and key
     assert len(fake_s3.gets) == 1
-    assert fake_s3.gets[0]["Bucket"] == "lake-bucket"
+    assert fake_s3.gets[0]["Bucket"] == SOURCE_BUCKET
     assert fake_s3.gets[0]["Key"] == "raw/rinexhourly/2024/150/auck1500.24o"
 
     # S3 put was called with proper output key
     assert len(fake_s3.puts) == 1
-    assert fake_s3.puts[0]["Bucket"] == "lake-bucket"
-    assert fake_s3.puts[0]["Key"] == "processed/station=auck/year=2024/doy=150/auck1500.parquet"
+    assert fake_s3.puts[0]["Bucket"] == DESTINATION_BUCKET
+    assert fake_s3.puts[0]["Key"] == "processed/tec/station=auck/year=2024/doy=150/auck1500.parquet"
     assert fake_s3.puts[0]["ContentType"] == "application/vnd.apache.parquet"
     assert fake_s3.puts[0]["Body"] == b"PAR1parquet"
 
@@ -399,5 +417,111 @@ def test_handler_full_success_all_deps_mocked(monkeypatch):
     # Second update: status = completed with output_key
     assert fake_ddb.updates[1]["ExpressionAttributeValues"][":status"]["S"] == "completed"
     assert fake_ddb.updates[1]["ExpressionAttributeValues"][":output_key"]["S"] == (
-        "processed/station=auck/year=2024/doy=150/auck1500.parquet"
+        "processed/tec/station=auck/year=2024/doy=150/auck1500.parquet"
     )
+
+
+def test_handler_default_params_includes_save_json(monkeypatch):
+    """_default_params_from_env includes SAVE_JSON, defaulting to False."""
+    monkeypatch.delenv("SAVE_JSON", raising=False)
+    params = processor_handler._default_params_from_env()
+    assert "SAVE_JSON" in params
+    assert params["SAVE_JSON"] is False
+
+
+def test_handler_save_json_env_true(monkeypatch):
+    """SAVE_JSON=true env var is parsed to True in defaults."""
+    monkeypatch.setenv("SAVE_JSON", "true")
+    params = processor_handler._default_params_from_env()
+    assert params["SAVE_JSON"] is True
+
+
+def test_handler_writes_json_when_save_json_enabled(monkeypatch):
+    """Handler writes .json output to S3 when SAVE_JSON=true."""
+    fake_s3 = FakeS3Client()
+    fake_ddb = FakeDdbClient()
+    _set_split_env(monkeypatch)
+    monkeypatch.setenv("NAV_DAY_OFFSET", "1")
+    monkeypatch.setenv("SAVE_PARQUET", "false")
+    monkeypatch.setenv("SAVE_JSON", "true")
+    monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
+    monkeypatch.setattr(processor_handler, "download_nav_file", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(processor_handler, "run_calibration", lambda *_args, **_kwargs: [_sample_row()])
+    monkeypatch.setattr(processor_handler, "rows_to_json_bytes", lambda rows: b'[{"sv":"G01"}]')
+
+    event = {
+        "Records": [
+            {
+                "messageId": "json-1",
+                "body": json.dumps({"key": "raw/rinexhourly/2024/150/auck1500.24o"}),
+            }
+        ]
+    }
+
+    result = processor_handler.handler(event, None)
+    assert result == {"batchItemFailures": []}
+    assert len(fake_s3.puts) == 1
+    assert fake_s3.puts[0]["Key"] == "processed/tec/station=auck/year=2024/doy=150/auck1500.json"
+    assert fake_s3.puts[0]["ContentType"] == "application/json"
+
+
+def test_handler_writes_both_parquet_and_json(monkeypatch):
+    """Handler writes both .parquet and .json when both flags enabled."""
+    fake_s3 = FakeS3Client()
+    fake_ddb = FakeDdbClient()
+    _set_split_env(monkeypatch)
+    monkeypatch.setenv("NAV_DAY_OFFSET", "1")
+    monkeypatch.setenv("SAVE_PARQUET", "true")
+    monkeypatch.setenv("SAVE_JSON", "true")
+    monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
+    monkeypatch.setattr(processor_handler, "download_nav_file", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(processor_handler, "run_calibration", lambda *_args, **_kwargs: [_sample_row()])
+    monkeypatch.setattr(processor_handler, "rows_to_parquet_bytes", lambda rows: b"PAR1")
+    monkeypatch.setattr(processor_handler, "rows_to_json_bytes", lambda rows: b"[]")
+
+    event = {
+        "Records": [
+            {
+                "messageId": "both-1",
+                "body": json.dumps({"key": "raw/rinexhourly/2024/150/auck1500.24o"}),
+            }
+        ]
+    }
+
+    result = processor_handler.handler(event, None)
+    assert result == {"batchItemFailures": []}
+    assert len(fake_s3.puts) == 2
+    put_keys = {p["Key"] for p in fake_s3.puts}
+    assert "processed/tec/station=auck/year=2024/doy=150/auck1500.parquet" in put_keys
+    assert "processed/tec/station=auck/year=2024/doy=150/auck1500.json" in put_keys
+
+
+def test_handler_does_not_use_geonet_pull_path(monkeypatch):
+    """Lambda handler must remain payload-driven and not pull GeoNet samples."""
+    from tools import geonet_samples
+
+    fake_s3 = FakeS3Client(raw_body=b"RINEX-OBS-DATA")
+    fake_ddb = FakeDdbClient()
+    _set_split_env(monkeypatch)
+    monkeypatch.setenv("NAV_DAY_OFFSET", "1")
+    monkeypatch.setattr(processor_handler, "boto3", FakeBoto3(fake_s3, fake_ddb))
+    monkeypatch.setattr(processor_handler, "download_nav_file", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(processor_handler, "run_calibration", lambda *_args, **_kwargs: [_sample_row()])
+    monkeypatch.setattr(processor_handler, "rows_to_parquet_bytes", lambda _rows: b"PAR1")
+    monkeypatch.setattr(
+        geonet_samples,
+        "download_auck_hourly_sample",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("must not be called")),
+    )
+
+    event = {
+        "Records": [
+            {
+                "messageId": "input-driven-1",
+                "body": json.dumps({"key": "raw/rinexhourly/2024/150/auck1500.24o"}),
+            }
+        ]
+    }
+
+    result = processor_handler.handler(event, None)
+    assert result == {"batchItemFailures": []}

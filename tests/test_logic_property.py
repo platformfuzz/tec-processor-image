@@ -26,6 +26,7 @@ DEFAULTS = {
     "SAVE_STATIC_PLOTS": False,
     "SAVE_INTERACTIVE_PLOTS": False,
 }
+DESTINATION_PREFIX = "processed/tec"
 
 
 # --- Hypothesis strategies for Property 4: Raw Key Parse Determinism ---
@@ -158,8 +159,8 @@ def test_property_deterministic_output_key():
         doy = random.randint(1, 366)
         station = random.choice(stations)
         stem = "".join(random.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(random.randint(4, 20)))
-        first = derive_output_key(station, year, doy, stem)
-        second = derive_output_key(station, year, doy, stem)
+        first = derive_output_key(station, year, doy, stem, DESTINATION_PREFIX)
+        second = derive_output_key(station, year, doy, stem, DESTINATION_PREFIX)
         assert first == second
 
 
@@ -388,8 +389,11 @@ class TestOutputPathDeterminism:
         self, station: str, year: int, doy: int, source_stem: str
     ) -> None:
         """Output key always equals the deterministic path template."""
-        result = derive_output_key(station, year, doy, source_stem)
-        expected = f"processed/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet"
+        result = derive_output_key(station, year, doy, source_stem, DESTINATION_PREFIX)
+        expected = (
+            f"{DESTINATION_PREFIX}/station={station}/year={year}/"
+            f"doy={doy:03d}/{source_stem}.parquet"
+        )
         assert result == expected
 
     @settings(max_examples=100)
@@ -405,8 +409,8 @@ class TestOutputPathDeterminism:
         self, station: str, year: int, doy: int, source_stem: str
     ) -> None:
         """Calling derive_output_key twice with same input gives same result."""
-        first = derive_output_key(station, year, doy, source_stem)
-        second = derive_output_key(station, year, doy, source_stem)
+        first = derive_output_key(station, year, doy, source_stem, DESTINATION_PREFIX)
+        second = derive_output_key(station, year, doy, source_stem, DESTINATION_PREFIX)
         assert first == second
 
 

@@ -4,16 +4,14 @@ version = "0.1.0"
 description = "TEC processor Lambda container image package."
 requires-python = ">=3.11,<3.14"
 dependencies = [
+  "awslambdaric>=3.1.1",
+  "boto3>=1.42.0",
+  "matplotlib>=3.10",
+  "plotly>=6.2",
   "pyarrow>=23.0.1",
   "polars>=1.5.0",
-  # NOTE: pytecgg currently supports Python 3.11-3.13 only.
-  # The python_version < '3.14' marker blocks install on Python 3.14.
-  # TRACKING (task 9.1): Once PyTECGg publishes Python 3.14-compatible
-  # Linux x86_64 wheels on PyPI, remove this marker and proceed with:
-  #   - Task 9.2: Update base image, requires-python, CI to Python 3.14
-  #   - Task 9.3: Validate full test suite and calibration on Python 3.14
-  # Until then, this repository targets Python 3.13 as its runtime.
-  # See Requirement 16 in .kiro/specs/tec-processor-image/requirements.md
+  # Runtime pin: this repository targets Python 3.13.
+  # Keep this marker aligned with requires-python and CI runtime policy.
   "pytecgg>=1.3.0; python_version < '3.14'",
 ]
 
@@ -36,4 +34,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
+markers = [
+  "integration_geonet: live GeoNet + BKG networked integration tests (opt-in)",
+]

@@ -19,8 +19,7 @@ def _require_pytecgg() -> dict[str, Any]:
         from pytecgg.tec_calibration import calculate_tec, calculate_vertical_equivalent, extract_arcs
     except Exception as exc:
         raise CalibrationError(
-            "PyTECGg is required for calibration (supported on Python 3.11-3.13). "
-            "Processor Lambda must use a compatible runtime until PyTECGg adds Python 3.14 support."
+            "PyTECGg is required for calibration; this repository targets Python 3.13 runtime compatibility."
         ) from exc
     return {
         "GNSSContext": GNSSContext,

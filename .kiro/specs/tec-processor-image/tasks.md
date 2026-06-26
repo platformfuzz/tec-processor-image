@@ -2,13 +2,13 @@
 
 ## Overview
 
-This plan implements the standalone OCI container image repository for the TEC processor Lambda. Work proceeds in waves: scaffold the repository structure, port processor code from the monorepo, add unit and property tests, configure CI/CD workflows, and document GHCR publishing plus deploy-time GHCR-to-ECR promotion steps.
+This plan implements the standalone OCI container image repository for the TEC processor Lambda. Work proceeds in waves: scaffold the repository structure, port processor code from the monorepo, add unit and property tests, configure CI/CD workflows, and document GHCR publishing plus deploy-time GHCR-to-ECR promotion steps. Multi-format output (Parquet, CSV, JSON, static PNG, interactive HTML) is implemented in Phase 12.
 
 ## Tasks
 
 - [x] 1. Scaffold repository structure and package metadata
   - [x] 1.1 Create Dockerfile and .dockerignore
-    - Create `Dockerfile` at repository root using `public.ecr.aws/lambda/python:3.13` base image (CPython 3.13, not "Python 13")
+    - Create `Dockerfile` at repository root using `python:3.13-slim` base image with Lambda compatibility via `awslambdaric`
     - COPY `pyproject.toml` and `requirements.lock` first for layer caching, then COPY `src/`
     - Set CMD to `["processor.handler.handler"]`
     - Create `.dockerignore` excluding `tests/`, `.github/`, `.kiro/`, `*.md`, `.git/`
@@ -47,7 +47,7 @@ This plan implements the standalone OCI container image repository for the TEC p
 - [x] 2. Port processor source modules from monorepo
   - [x] 2.1 Implement handler.py — Lambda entry point
     - Create `src/processor/handler.py` with `handler(event, context)` function
-    - Validate `DATA_LAKE_BUCKET` is set at entry (fail-fast RuntimeError)
+    - Validate split S3 config (`SOURCE_BUCKET`, `SOURCE_PREFIX`, `DESTINATION_BUCKET`, `DESTINATION_PREFIX`) is set at entry (fail-fast RuntimeError)
     - Iterate `event["Records"]`, normalize each payload via body parsing
     - Delegate to `logic.process_record()` per record, catch `ProcessingError`
     - Collect `batchItemFailures` with `itemIdentifier` for failed records
@@ -56,13 +56,13 @@ This plan implements the standalone OCI container image repository for the TEC p
     - _Requirements: 3.1, 3.5, 3.7, 3.8, 3.9, 3.10, 6.6, 13.1_
 
   - [x] 2.2 Implement logic.py — per-record orchestration and payload normalization
-    - Create `src/processor/logic.py` with `process_record(payload, bucket, env_params)` function
+    - Create `src/processor/logic.py` with `process_record(payload, source_bucket, source_prefix, destination_bucket, destination_prefix, env_params)` function
     - Implement payload normalization for three formats: direct message, S3 event, SNS-wrapped S3 event
     - Parse raw key → `(year, doy, station, source_stem)` with validation
     - Merge message parameters over environment defaults with validation
     - Orchestrate: nav fetch → calibration → parquet write → DynamoDB update
     - Generate UUID v4 trace_id when not provided; propagate through all log entries
-    - Handle bucket mismatch check for optional `bucket` field
+    - Handle source bucket mismatch check for optional `bucket` field and enforce source prefix match
     - _Requirements: 3.2, 3.3, 3.4, 3.6, 3.11, 4.1, 4.2, 7.1, 7.2, 7.3, 7.4, 13.5, 13.6_
 
   - [x] 2.3 Implement nav.py — BKG navigation file fetch
@@ -86,7 +86,7 @@ This plan implements the standalone OCI container image repository for the TEC p
   - [x] 2.5 Implement parquet_io.py — Parquet encoding and S3 write
     - Create `src/processor/parquet_io.py` with `write_parquet(df, bucket, station, year, doy, source_stem)` and `build_output_key(station, year, doy, source_stem)`
     - Define `OUTPUT_COLUMNS` list with exactly 11 columns
-    - Write Snappy-compressed Parquet to deterministic S3 key: `processed/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet`
+    - Write Snappy-compressed Parquet to deterministic S3 key: `{DESTINATION_PREFIX}/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet`
     - Validate DataFrame schema matches expected columns before write
     - Use `s3.put_object` with Parquet binary (PAR1 magic bytes)
     - Overwrite existing key for idempotent reprocessing
@@ -112,7 +112,7 @@ This plan implements the standalone OCI container image repository for the TEC p
 - [x] 4. Unit and property tests
   - [x] 4.1 Create tests/conftest.py with shared fixtures
     - Set up pytest fixtures for mocked S3, DynamoDB (using moto), and sample SQS events
-    - Create fixture for environment variables (`DATA_LAKE_BUCKET`, `JOBS_TABLE_NAME`, parameter defaults)
+    - Create fixture for environment variables (`SOURCE_BUCKET`, `SOURCE_PREFIX`, `DESTINATION_BUCKET`, `DESTINATION_PREFIX`, `JOBS_TABLE_NAME`, parameter defaults)
     - _Requirements: 14.5_
 
   - [x] 4.2 Write property test for raw key parsing
@@ -138,7 +138,7 @@ This plan implements the standalone OCI container image repository for the TEC p
   - [x] 4.5 Write property test for output key derivation
     - __Property 9: Output Path Determinism__
     - Generate `(station, year, doy, source_stem)` tuples via Hypothesis
-    - Assert output key always matches `processed/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet`
+    - Assert output key always matches `{DESTINATION_PREFIX}/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet`
     - __Validates: Requirements 6.1, 6.3__
 
   - [x] 4.6 Write property test for parameter merging
@@ -192,7 +192,7 @@ This plan implements the standalone OCI container image repository for the TEC p
     - Test invalid JSON body handling
     - Test bucket mismatch rejection
     - Test DynamoDB update failure isolation (warning only)
-    - Test `DATA_LAKE_BUCKET` unset fail-fast
+    - Test split S3 env unset fail-fast (`SOURCE_BUCKET`, `SOURCE_PREFIX`, `DESTINATION_BUCKET`, `DESTINATION_PREFIX`)
     - _Requirements: 3.1, 3.5, 3.7, 3.8, 3.9, 3.10, 3.11, 6.6, 8.4, 8.5_
 
   - [x] 4.14 Write unit tests for Parquet output encoding
@@ -239,23 +239,79 @@ This plan implements the standalone OCI container image repository for the TEC p
     - _Requirements: 15.5_
 
 - [x] 9. Python runtime compatibility gate (greenfield)
-  - [x] 9.1 Track upstream PyTECGg Python 3.14 support
-    - Verify PyPI artifacts include Python 3.14-compatible Linux wheel(s) for Lambda target
-    - Confirm dependency marker no longer blocks Python 3.14 install path
+  - [x] 9.1 Set and document Python 3.13 as accepted baseline
+    - Keep Docker runtime base, docs, and CI runtime statements aligned to Python 3.13
+    - Keep `requires-python` and dependency markers aligned to runtime policy
     - _Requirements: 16.1, 16.2_
 
-  - [x] 9.2 Prepare runtime-switch PR (only after 9.1 passes)
-    - Update Docker base image from Python 3.13 to Python 3.14
-    - Update `pyproject.toml` `requires-python` and any dependency markers to permit 3.14
-    - Update `.github/workflows/ci.yml` reusable input from Python 3.13 to Python 3.14
-    - Update compatibility messaging in docs/code (including calibration error text)
+  - [x] 9.2 Validate Python 3.13 runtime and CI cohesion
+    - Confirm test/lint/build commands run successfully against the Python 3.13 baseline
+    - Confirm compatibility messaging in docs/code matches accepted baseline
     - _Requirements: 16.3, 16.4_
 
-  - [x] 9.3 Validate runtime switch end-to-end
-    - Run full test suite and ensure calibration path works on Python 3.14
-    - Run Docker validate + Trivy checks on migrated image
-    - Confirm no remaining references to Python 3.13 in runtime/CI requirements
+  - [x] 9.3 Prevent drift from Python 3.13 baseline
+    - Ensure no runtime/CI docs imply a required move to another Python version
+    - Keep dependency and runtime constraints consistent across repo files
     - _Requirements: 16.3, 16.4_
+
+- [x] 10. Local GeoNet AUCK integration workflow
+  - [x] 10.1 Add local-only fixed-sample GeoNet fetch helper
+    - Add `tools/geonet_samples.py` with AUCK fixed sample key candidates from `s3://geonet-open-data/gnss/rinexhourly/`
+    - Keep helper local-only; no Lambda handler dependency
+    - _Requirements: 3.2, 3.11, 14.5, 17.1, 17.2_
+
+  - [x] 10.2 Add local AUCK end-to-end runner
+    - Add `tools/local_geonet_runner.py` for local sample download + BKG nav fetch + PyTECGg calibration + local parquet write
+    - _Requirements: 5.1, 6.2, 11.1, 17.3_
+
+  - [x] 10.3 Add test split for live GeoNet integration
+    - Add marker `integration_geonet` and opt-in tests under `tests/test_geonet_integration.py`
+    - Keep PR CI deterministic by excluding live marker in CI test command
+    - _Requirements: 10.2, 14.5, 17.4_
+
+  - [x] 10.4 Enforce input-driven Lambda behavior
+    - Add unit test asserting handler remains payload-driven and does not call local GeoNet pull helpers
+    - _Requirements: 3.2, 3.11, 17.2_
+
+- [x] 11. Kiro developer enablement
+  - [x] 11.1 Document Kiro workflow in README
+    - Add sections covering local GeoNet run commands, integration marker usage, and Kiro guidance
+    - _Requirements: 11.1, 15.5, 17.5_
+
+- [x] 12. Multi-format output support
+  - [x] 12.1 Add CSV serializer (csv_io.py)
+    - Create `src/processor/csv_io.py` with `rows_to_csv_bytes(rows) -> bytes` using Polars `write_csv()`
+    - Preserves column order matching PARQUET_COLUMNS
+    - _Requirements: 6.1, 6.7_
+
+  - [x] 12.2 Add JSON serializer (json_io.py)
+    - Create `src/processor/json_io.py` with `rows_to_json_bytes(rows) -> bytes` using stdlib `json.dumps`
+    - Epoch strings preserved as-is in ISO 8601 format
+    - _Requirements: 6.1, 6.7_
+
+  - [x] 12.3 Add plot serializers (plot_io.py)
+    - Create `src/processor/plot_io.py` with `rows_to_static_plot_bytes` (PNG via matplotlib) and `rows_to_interactive_plot_bytes` (HTML via plotly CDN)
+    - Port plot functions from PyTECGg Batch Calibrator, adapted to return bytes instead of writing to disk
+    - Add `matplotlib >= 3.10` and `plotly >= 6.2` to pyproject.toml and requirements.lock
+    - _Requirements: 6.1, 6.7_
+
+  - [x] 12.4 Update logic.py for multi-format orchestration
+    - Add `SAVE_JSON` to `ALLOWED_PARAMS` and boolean validation
+    - Update `require_output_format` to accept any of the five flags (not just Parquet)
+    - Add `extension` parameter (default `"parquet"`) to `derive_output_key`
+    - Update `process_record` to write all enabled formats in independent if-checks, returning primary key
+    - _Requirements: 6.1, 6.2, 6.5, 7.1, 7.2, 7.4_
+
+  - [x] 12.5 Update handler.py and main.py for multi-format
+    - Add `SAVE_JSON` to `_default_params_from_env()` in handler.py and main.py
+    - Update `_process_message` to write all enabled formats
+    - _Requirements: 6.1, 7.1_
+
+  - [x] 12.6 Add serializer unit tests and update existing tests
+    - Add `tests/test_csv_io_unit.py`, `tests/test_json_io_unit.py`, `tests/test_plot_io_unit.py`
+    - Update `tests/test_logic_unit.py` to reflect new `require_output_format` behavior and extension support
+    - Add multi-format write tests to `tests/test_handler_unit.py`
+    - _Requirements: 6.1, 6.2, 7.1, 14.2_
 
 ## Notes
 

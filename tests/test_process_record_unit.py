@@ -9,12 +9,17 @@ import pytest
 
 from processor.logic import process_record
 
+SOURCE_BUCKET = "source-bucket"
+SOURCE_PREFIX = "raw/rinexhourly"
+DESTINATION_BUCKET = "destination-bucket"
+DESTINATION_PREFIX = "processed/tec"
+
 
 @pytest.fixture
 def valid_payload():
     return {
         "key": "raw/rinexhourly/2024/150/auck1500.24o",
-        "bucket": "my-data-lake",
+        "bucket": SOURCE_BUCKET,
         "job_id": "job-123",
         "trace_id": "550e8400-e29b-41d4-a716-446655440000",
         "parameters": None,
@@ -67,11 +72,19 @@ def test_process_record_success(
 
     with patch("processor.logic.boto3") as mock_boto3:
         mock_boto3.client.return_value = mock_s3
-        result = process_record(valid_payload, "my-data-lake", env_params)
+        result = process_record(
+            valid_payload,
+            SOURCE_BUCKET,
+            SOURCE_PREFIX,
+            DESTINATION_BUCKET,
+            DESTINATION_PREFIX,
+            env_params,
+        )
 
-    assert result == "processed/station=auck/year=2024/doy=150/auck1500.parquet"
+    assert result == "processed/tec/station=auck/year=2024/doy=150/auck1500.parquet"
     mock_nav.assert_called_once_with(2024, 150, 1)
-    mock_s3.get_object.assert_called_once_with(Bucket="my-data-lake", Key="raw/rinexhourly/2024/150/auck1500.24o")
+    mock_s3.get_object.assert_called_once_with(Bucket=SOURCE_BUCKET, Key="raw/rinexhourly/2024/150/auck1500.24o")
+    assert mock_s3.put_object.call_args.kwargs["Bucket"] == DESTINATION_BUCKET
     mock_s3.put_object.assert_called_once()
 
 
@@ -85,7 +98,14 @@ def test_process_record_bucket_mismatch(env_params):
     }
 
     with pytest.raises(ValueError, match="Unexpected source bucket"):
-        process_record(payload, "my-data-lake", env_params)
+        process_record(
+            payload,
+            SOURCE_BUCKET,
+            SOURCE_PREFIX,
+            DESTINATION_BUCKET,
+            DESTINATION_PREFIX,
+            env_params,
+        )
 
 
 def test_process_record_missing_key(env_params):
@@ -93,7 +113,14 @@ def test_process_record_missing_key(env_params):
     payload = {"bucket": "my-data-lake", "trace_id": None, "parameters": None}
 
     with pytest.raises(ValueError, match="missing required 'key' field"):
-        process_record(payload, "my-data-lake", env_params)
+        process_record(
+            payload,
+            SOURCE_BUCKET,
+            SOURCE_PREFIX,
+            DESTINATION_BUCKET,
+            DESTINATION_PREFIX,
+            env_params,
+        )
 
 
 def test_process_record_invalid_key(env_params):
@@ -104,8 +131,34 @@ def test_process_record_invalid_key(env_params):
         "parameters": None,
     }
 
-    with pytest.raises(ValueError, match="Malformed raw key"):
-        process_record(payload, "my-data-lake", env_params)
+    with pytest.raises(ValueError, match="SOURCE_PREFIX"):
+        process_record(
+            payload,
+            SOURCE_BUCKET,
+            SOURCE_PREFIX,
+            DESTINATION_BUCKET,
+            DESTINATION_PREFIX,
+            env_params,
+        )
+
+
+def test_process_record_source_prefix_mismatch(env_params):
+    payload = {
+        "key": "other/prefix/2024/150/auck1500.24o",
+        "bucket": SOURCE_BUCKET,
+        "trace_id": None,
+        "parameters": None,
+    }
+
+    with pytest.raises(ValueError, match="SOURCE_PREFIX"):
+        process_record(
+            payload,
+            SOURCE_BUCKET,
+            SOURCE_PREFIX,
+            DESTINATION_BUCKET,
+            DESTINATION_PREFIX,
+            env_params,
+        )
 
 
 @patch("processor.logic.fetch_nav_file")
@@ -117,7 +170,7 @@ def test_process_record_generates_trace_id(
     """process_record generates UUID v4 trace_id when not provided."""
     payload = {
         "key": "raw/rinexhourly/2024/150/auck1500.24o",
-        "bucket": "my-data-lake",
+        "bucket": SOURCE_BUCKET,
         "trace_id": None,
         "parameters": None,
     }
@@ -131,9 +184,16 @@ def test_process_record_generates_trace_id(
 
     with patch("processor.logic.boto3") as mock_boto3:
         mock_boto3.client.return_value = mock_s3
-        result = process_record(payload, "my-data-lake", env_params)
+        result = process_record(
+            payload,
+            SOURCE_BUCKET,
+            SOURCE_PREFIX,
+            DESTINATION_BUCKET,
+            DESTINATION_PREFIX,
+            env_params,
+        )
 
-    assert result == "processed/station=auck/year=2024/doy=150/auck1500.parquet"
+    assert result == "processed/tec/station=auck/year=2024/doy=150/auck1500.parquet"
 
 
 @patch("processor.logic.fetch_nav_file")
@@ -158,9 +218,16 @@ def test_process_record_no_bucket_field_uses_default(
 
     with patch("processor.logic.boto3") as mock_boto3:
         mock_boto3.client.return_value = mock_s3
-        result = process_record(payload, "my-data-lake", env_params)
+        result = process_record(
+            payload,
+            SOURCE_BUCKET,
+            SOURCE_PREFIX,
+            DESTINATION_BUCKET,
+            DESTINATION_PREFIX,
+            env_params,
+        )
 
-    assert result == "processed/station=auck/year=2024/doy=150/auck1500.parquet"
+    assert result == "processed/tec/station=auck/year=2024/doy=150/auck1500.parquet"
 
 
 @patch("processor.logic.fetch_nav_file")
@@ -172,7 +239,7 @@ def test_process_record_message_params_override(
     """process_record merges message parameters over env defaults."""
     payload = {
         "key": "raw/rinexhourly/2024/150/auck1500.24o",
-        "bucket": "my-data-lake",
+        "bucket": SOURCE_BUCKET,
         "trace_id": "trace-1",
         "parameters": {"NAV_DAY_OFFSET": 3},
     }
@@ -193,8 +260,15 @@ def test_process_record_message_params_override(
 
     with patch("processor.logic.boto3") as mock_boto3:
         mock_boto3.client.return_value = mock_s3
-        result = process_record(payload, "my-data-lake", env)
+        result = process_record(
+            payload,
+            SOURCE_BUCKET,
+            SOURCE_PREFIX,
+            DESTINATION_BUCKET,
+            DESTINATION_PREFIX,
+            env,
+        )
 
-    assert result == "processed/station=auck/year=2024/doy=150/auck1500.parquet"
+    assert result == "processed/tec/station=auck/year=2024/doy=150/auck1500.parquet"
     # NAV_DAY_OFFSET=3 means fetch_nav_file should be called with offset 3
     mock_nav.assert_called_once_with(2024, 150, 3)

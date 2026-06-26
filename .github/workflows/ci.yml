@@ -15,4 +15,5 @@ jobs:
     uses: actionsforge/actions/.github/workflows/python-image-pr-checks.yml@main
     with:
       python-version: "3.13"
+      test-command: pytest tests/ -v -m "not integration_geonet"
       trivy-vuln-type: library

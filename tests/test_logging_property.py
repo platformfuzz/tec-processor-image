@@ -21,27 +21,22 @@ from processor.logging import log_entry, log_error, log_skipped, log_success
 
 # Strategy for arbitrary log field values (strings, ints, floats, booleans, None)
 _field_values = st.one_of(
-    st.text(min_size=0, max_size=200),
+    st.text(min_size=0, max_size=64),
     st.integers(min_value=-(2**53), max_value=2**53),
     st.floats(allow_nan=False, allow_infinity=False),
     st.booleans(),
     st.none(),
 )
 
-# Strategy for field names (valid Python identifiers, non-empty)
-_field_names = st.text(
-    alphabet="abcdefghijklmnopqrstuvwxyz_", min_size=1, max_size=30
-)
+# Strategy for field names (identifier-like, lightweight generation)
+_field_names = st.from_regex(r"[a-z_][a-z_0-9]{0,20}", fullmatch=True)
 
 
 @st.composite
 def arbitrary_log_fields(draw: st.DrawFn) -> dict:
     """Generate a dict of arbitrary keyword fields for log_entry."""
-    keys = draw(st.lists(_field_names, min_size=0, max_size=10, unique=True))
-    fields = {}
-    for key in keys:
-        fields[key] = draw(_field_values)
-    return fields
+    # Use dictionaries directly to avoid slow unique-list + per-key draw patterns.
+    return draw(st.dictionaries(keys=_field_names, values=_field_values, min_size=0, max_size=8))
 
 
 class TestStructuredJsonLogFormat:

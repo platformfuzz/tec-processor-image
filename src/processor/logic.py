@@ -19,16 +19,39 @@ except Exception:  # pragma: no cover - local test compatibility
 
 from . import CalibrationError, OutputError, ProcessingError
 from .calibration import run_calibration
+from .csv_io import rows_to_csv_bytes
+from .json_io import rows_to_json_bytes
 from .nav import fetch_nav_file
 from .parquet_io import rows_to_parquet_bytes
+from .plot_io import rows_to_interactive_plot_bytes, rows_to_static_plot_bytes
 
-RAW_KEY_RE = re.compile(r"^raw/rinexhourly/(?P<year>\d{4})/(?P<doy>\d{3})/(?P<filename>[^/]+)$")
+RAW_KEY_RE = re.compile(
+    r"^(?:raw|gnss)/rinexhourly/(?P<year>\d{4})/(?P<doy>\d{3})/(?P<filename>[^/]+)$"
+)
 ALLOWED_PARAMS = {
     "NAV_DAY_OFFSET",
     "SAVE_PARQUET",
     "SAVE_CSV",
+    "SAVE_JSON",
     "SAVE_STATIC_PLOTS",
     "SAVE_INTERACTIVE_PLOTS",
+}
+
+# Priority order for primary output key selection when multiple formats enabled
+_FORMAT_PRIORITY = ["SAVE_PARQUET", "SAVE_CSV", "SAVE_JSON", "SAVE_STATIC_PLOTS", "SAVE_INTERACTIVE_PLOTS"]
+_FORMAT_EXTENSION = {
+    "SAVE_PARQUET": "parquet",
+    "SAVE_CSV": "csv",
+    "SAVE_JSON": "json",
+    "SAVE_STATIC_PLOTS": "png",
+    "SAVE_INTERACTIVE_PLOTS": "html",
+}
+_FORMAT_CONTENT_TYPE = {
+    "SAVE_PARQUET": "application/vnd.apache.parquet",
+    "SAVE_CSV": "text/csv",
+    "SAVE_JSON": "application/json",
+    "SAVE_STATIC_PLOTS": "image/png",
+    "SAVE_INTERACTIVE_PLOTS": "text/html",
 }
 
 
@@ -52,9 +75,38 @@ def parse_raw_key(key: str) -> tuple[int, int, str, str]:
     return year, doy, station.lower(), source_stem
 
 
-def derive_output_key(station: str, year: int, doy: int, source_stem: str) -> str:
-    """Return deterministic processed output key."""
-    return f"processed/station={station.lower()}/year={year}/doy={doy:03d}/{source_stem}.parquet"
+def _normalize_prefix(prefix: str) -> str:
+    """Return slash-normalized S3 key prefix without leading/trailing slash."""
+    cleaned = prefix.strip().strip("/")
+    if not cleaned:
+        raise ValueError("Prefix must not be empty")
+    return cleaned
+
+
+def _matches_prefix(key: str, prefix: str) -> bool:
+    normalized = _normalize_prefix(prefix)
+    return key == normalized or key.startswith(normalized + "/")
+
+
+def derive_output_key(
+    station: str,
+    year: int,
+    doy: int,
+    source_stem: str,
+    destination_prefix: str,
+    extension: str = "parquet",
+) -> str:
+    """Return deterministic output key under destination prefix.
+
+    The ``extension`` parameter controls the file suffix (default ``parquet``
+    for backward compatibility). Pass ``csv``, ``json``, ``png``, or ``html``
+    for other formats.
+    """
+    normalized_prefix = _normalize_prefix(destination_prefix)
+    return (
+        f"{normalized_prefix}/station={station.lower()}/year={year}/"
+        f"doy={doy:03d}/{source_stem}.{extension}"
+    )
 
 
 def _days_in_year(year: int) -> int:
@@ -93,7 +145,7 @@ def validate_processing_params(params: dict) -> dict:
         if nav_offset <= 0:
             raise ValueError(f"Invalid NAV_DAY_OFFSET: {nav_offset}")
 
-    for key in ("SAVE_PARQUET", "SAVE_CSV", "SAVE_STATIC_PLOTS", "SAVE_INTERACTIVE_PLOTS"):
+    for key in ("SAVE_PARQUET", "SAVE_CSV", "SAVE_JSON", "SAVE_STATIC_PLOTS", "SAVE_INTERACTIVE_PLOTS"):
         value = validated.get(key)
         if value is not None and not isinstance(value, bool):
             raise ValueError(f"Invalid {key}: {value}")
@@ -113,13 +165,14 @@ def merge_parameters(env_defaults: dict, message_overrides: dict | None) -> dict
 
 
 def require_output_format(params: dict) -> None:
-    """Ensure at least one supported output format is enabled."""
-    if params.get("SAVE_PARQUET"):
-        return
-    unsupported = [key for key in ("SAVE_CSV", "SAVE_STATIC_PLOTS", "SAVE_INTERACTIVE_PLOTS") if params.get(key)]
-    if unsupported:
-        raise ValueError(f"Unsupported output formats requested: {', '.join(unsupported)}")
-    raise ValueError("No output format enabled: SAVE_PARQUET is false")
+    """Ensure at least one output format flag is enabled."""
+    for flag in _FORMAT_PRIORITY:
+        if params.get(flag):
+            return
+    raise ValueError(
+        "No output format enabled: set at least one of "
+        + ", ".join(_FORMAT_PRIORITY)
+    )
 
 
 def extract_message_payload(record_body: str) -> dict[str, Any]:
@@ -251,23 +304,33 @@ def safe_update_job_status(
 
 def process_record(
     payload: dict,
-    bucket: str,
+    source_bucket: str,
+    source_prefix: str,
+    destination_bucket: str,
+    destination_prefix: str,
     env_params: dict,
+    *,
+    s3_client: Any | None = None,
+    write_output: bool = True,
 ) -> str:
     """
     Process a single normalized SQS record payload.
 
-    Orchestrates the full processing pipeline: key parsing, parameter merging,
-    navigation fetch, S3 raw download, calibration, parquet write, and returns
-    the output S3 key.
+    Orchestrates key parsing, parameter merging, nav fetch, source S3 read,
+    calibration, optional destination S3 write, and returns output key.
 
     Args:
         payload: Normalized dict with key, bucket, job_id, trace_id, parameters
-        bucket: DATA_LAKE_BUCKET value
+        source_bucket: S3 bucket used for input object reads
+        source_prefix: Required source key prefix (validation contract)
+        destination_bucket: S3 bucket used for output object writes
+        destination_prefix: Required destination key prefix for outputs
         env_params: Environment-derived defaults for processing parameters
+        s3_client: Optional S3 client override (for testing/public-read modes)
+        write_output: When False, skip S3 output write after successful processing
 
     Returns:
-        output_key: S3 key of written Parquet file
+        output_key: Primary output key (first enabled format by priority order).
 
     Raises:
         ProcessingError (or subclass) on any failure
@@ -281,9 +344,11 @@ def process_record(
         raise ValueError("Payload missing required 'key' field")
 
     # 2. Bucket mismatch check
-    source_bucket = payload.get("bucket")
-    if source_bucket and source_bucket != bucket:
-        raise ValueError(f"Unexpected source bucket: {source_bucket}")
+    payload_bucket = payload.get("bucket")
+    if payload_bucket and payload_bucket != source_bucket:
+        raise ValueError(f"Unexpected source bucket: {payload_bucket}")
+    if not _matches_prefix(raw_key, source_prefix):
+        raise ValueError(f"Raw key does not match SOURCE_PREFIX '{source_prefix}': {raw_key}")
 
     # 3. Parse raw key → year, doy, station, source_stem
     year, doy, station, source_stem = parse_raw_key(raw_key)
@@ -298,48 +363,62 @@ def process_record(
     nav_day_offset = params["NAV_DAY_OFFSET"]
     nav_year, nav_doy = compute_nav_doy(doy, year, nav_day_offset)
 
-    # 7. Derive deterministic output key
-    output_key = derive_output_key(station, year, doy, source_stem)
-
-    # 8. Fetch navigation file
+    # 7. Fetch navigation file
     nav_path = fetch_nav_file(year, doy, nav_day_offset)
 
-    # 9. Download raw RINEX from S3
+    # 8. Download raw RINEX from S3
     if boto3 is None:
         raise ProcessingError("boto3 is required for S3 operations")
 
-    s3 = boto3.client("s3")
+    s3 = s3_client or boto3.client("s3")
+
+    primary_key: str | None = None
 
     with tempfile.TemporaryDirectory(prefix="processor-") as tmp_dir:
         work_dir = Path(tmp_dir)
 
-        response = s3.get_object(Bucket=bucket, Key=raw_key)
+        response = s3.get_object(Bucket=source_bucket, Key=raw_key)
         raw_bytes = response["Body"].read()
         if not raw_bytes:
             raise ProcessingError(f"Raw object is empty: {raw_key}")
 
-        # Write observation file locally
         filename = raw_key.rsplit("/", 1)[-1]
         observation_path = work_dir / filename
         observation_path.write_bytes(raw_bytes)
 
-        # 10. Run calibration
+        # 9. Run calibration
         rows = run_calibration(observation_path, nav_path, station, params)
 
         if not rows:
             raise CalibrationError("Calibration produced no valid TEC rows")
 
-        # 11. Write parquet to S3
-        if params.get("SAVE_PARQUET"):
-            parquet_body = rows_to_parquet_bytes(rows)
-            try:
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=output_key,
-                    Body=parquet_body,
-                    ContentType="application/vnd.apache.parquet",
-                )
-            except Exception as exc:
-                raise OutputError(f"S3 put_object failed for key '{output_key}': {exc}") from exc
+        # 10. Write all enabled output formats (independent if-checks, same as PyTECGg Batch Calibrator)
+        _serializers = {
+            "SAVE_PARQUET": lambda: rows_to_parquet_bytes(rows),
+            "SAVE_CSV": lambda: rows_to_csv_bytes(rows),
+            "SAVE_JSON": lambda: rows_to_json_bytes(rows),
+            "SAVE_STATIC_PLOTS": lambda: rows_to_static_plot_bytes(rows, station, year, doy),
+            "SAVE_INTERACTIVE_PLOTS": lambda: rows_to_interactive_plot_bytes(rows, station, year, doy),
+        }
+        for fmt in _FORMAT_PRIORITY:
+            if not params.get(fmt):
+                continue
+            ext = _FORMAT_EXTENSION[fmt]
+            output_key = derive_output_key(station, year, doy, source_stem, destination_prefix, extension=ext)
+            if primary_key is None:
+                primary_key = output_key
+            if write_output:
+                body = _serializers[fmt]()
+                try:
+                    s3.put_object(
+                        Bucket=destination_bucket,
+                        Key=output_key,
+                        Body=body,
+                        ContentType=_FORMAT_CONTENT_TYPE[fmt],
+                    )
+                except Exception as exc:
+                    raise OutputError(f"S3 put_object failed for key '{output_key}': {exc}") from exc
 
-    return output_key
+    if primary_key is None:
+        raise OutputError("No output format written")
+    return primary_key

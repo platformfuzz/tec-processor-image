@@ -1,9 +1,20 @@
-FROM public.ecr.aws/lambda/python:3.13
+FROM python:3.13-slim
 
-# Install application package from repository root pyproject.toml
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
+    PROCESSOR_MODE=lambda \
+    ENABLE_DEBUG_SHELL=false
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml requirements.lock ./
 RUN pip install --no-cache-dir -r requirements.lock
 
-COPY src/ ${LAMBDA_TASK_ROOT}/
+COPY src/ /app/src/
 
-CMD ["processor.handler.handler"]
+ENTRYPOINT ["python", "-m", "processor.main"]

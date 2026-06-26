@@ -17,7 +17,13 @@ except Exception:  # pragma: no cover - local test compatibility
     boto3 = None  # type: ignore[assignment]
 
 from .calibration import run_calibration
+from .csv_io import rows_to_csv_bytes
+from .json_io import rows_to_json_bytes
 from .logic import (
+    _FORMAT_CONTENT_TYPE,
+    _FORMAT_EXTENSION,
+    _FORMAT_PRIORITY,
+    _matches_prefix,
     compute_nav_doy,
     derive_output_key,
     extract_message_payload,
@@ -27,6 +33,7 @@ from .logic import (
 )
 from .nav import download_nav_file
 from .parquet_io import rows_to_parquet_bytes
+from .plot_io import rows_to_interactive_plot_bytes, rows_to_static_plot_bytes
 
 
 def _log(payload: dict[str, Any]) -> None:
@@ -49,6 +56,7 @@ def _default_params_from_env() -> dict[str, Any]:
         "NAV_DAY_OFFSET": int(os.getenv("NAV_DAY_OFFSET", "1")),
         "SAVE_PARQUET": _parse_bool(os.getenv("SAVE_PARQUET", "true"), True),
         "SAVE_CSV": _parse_bool(os.getenv("SAVE_CSV", "false"), False),
+        "SAVE_JSON": _parse_bool(os.getenv("SAVE_JSON", "false"), False),
         "SAVE_STATIC_PLOTS": _parse_bool(os.getenv("SAVE_STATIC_PLOTS", "false"), False),
         "SAVE_INTERACTIVE_PLOTS": _parse_bool(os.getenv("SAVE_INTERACTIVE_PLOTS", "false"), False),
     }
@@ -119,7 +127,10 @@ def _process_message(
     *,
     s3: Any,
     ddb: Any,
-    data_lake_bucket: str,
+    source_bucket: str,
+    source_prefix: str,
+    destination_bucket: str,
+    destination_prefix: str,
     jobs_table_name: str | None,
     defaults: dict[str, Any],
     payload: dict[str, Any],
@@ -128,15 +139,16 @@ def _process_message(
 ) -> None:
     trace_id = payload.get("trace_id") or str(uuid.uuid4())
     raw_key = payload["key"]
-    source_bucket = payload.get("bucket") or data_lake_bucket
-    if source_bucket != data_lake_bucket:
-        raise ValueError(f"Unexpected source bucket: {source_bucket}")
+    payload_bucket = payload.get("bucket")
+    if payload_bucket and payload_bucket != source_bucket:
+        raise ValueError(f"Unexpected source bucket: {payload_bucket}")
+    if not _matches_prefix(raw_key, source_prefix):
+        raise ValueError(f"Raw key does not match SOURCE_PREFIX '{source_prefix}': {raw_key}")
 
     year, doy, station, source_stem = parse_raw_key(raw_key)
     params = merge_parameters(defaults, payload.get("parameters"))
     require_output_format(params)
     nav_year, nav_doy = compute_nav_doy(doy, year, params["NAV_DAY_OFFSET"])
-    output_key = derive_output_key(station, year, doy, source_stem)
     job_id = payload.get("job_id")
 
     _safe_update_job_status(
@@ -147,9 +159,17 @@ def _process_message(
         trace_id=trace_id,
     )
 
+    _serializers = {
+        "SAVE_PARQUET": lambda rows: rows_to_parquet_bytes(rows),
+        "SAVE_CSV": lambda rows: rows_to_csv_bytes(rows),
+        "SAVE_JSON": lambda rows: rows_to_json_bytes(rows),
+        "SAVE_STATIC_PLOTS": lambda rows: rows_to_static_plot_bytes(rows, station, year, doy),
+        "SAVE_INTERACTIVE_PLOTS": lambda rows: rows_to_interactive_plot_bytes(rows, station, year, doy),
+    }
+
     with tempfile.TemporaryDirectory(prefix="processor-") as tmp_dir:
         work_dir = Path(tmp_dir)
-        response = s3.get_object(Bucket=data_lake_bucket, Key=raw_key)
+        response = s3.get_object(Bucket=source_bucket, Key=raw_key)
         raw_bytes = response["Body"].read()
         if not raw_bytes:
             raise ValueError(f"Raw object is empty: {raw_key}")
@@ -158,13 +178,20 @@ def _process_message(
         navigation_path = download_nav_file(nav_year, nav_doy, work_dir / "nav")
         rows = run_calibration(observation_path, navigation_path, station, params)
 
-        if params["SAVE_PARQUET"]:
-            parquet_body = rows_to_parquet_bytes(rows)
+        primary_key: str | None = None
+        for fmt in _FORMAT_PRIORITY:
+            if not params.get(fmt):
+                continue
+            ext = _FORMAT_EXTENSION[fmt]
+            output_key = derive_output_key(station, year, doy, source_stem, destination_prefix, extension=ext)
+            if primary_key is None:
+                primary_key = output_key
+            body = _serializers[fmt](rows)
             s3.put_object(
-                Bucket=data_lake_bucket,
+                Bucket=destination_bucket,
                 Key=output_key,
-                Body=parquet_body,
-                ContentType="application/vnd.apache.parquet",
+                Body=body,
+                ContentType=_FORMAT_CONTENT_TYPE[fmt],
             )
 
     _safe_update_job_status(
@@ -172,7 +199,7 @@ def _process_message(
         table_name=jobs_table_name,
         job_id=job_id,
         status="completed",
-        output_key=output_key,
+        output_key=primary_key,
         trace_id=trace_id,
     )
     _log(
@@ -181,7 +208,7 @@ def _process_message(
             "station": station,
             "year": year,
             "doy": doy,
-            "output_key": output_key,
+            "output_key": primary_key,
             "row_count": len(rows),
             "duration_ms": int((time.time() - started_at) * 1000),
             "outcome": "success",
@@ -193,10 +220,19 @@ def _process_message(
 def handler(event: dict, context: object) -> dict:
     """Process SQS batch and report partial failures."""
     started_at = time.time()
-    data_lake_bucket = os.getenv("DATA_LAKE_BUCKET")
+    source_bucket = os.getenv("SOURCE_BUCKET")
+    source_prefix = os.getenv("SOURCE_PREFIX")
+    destination_bucket = os.getenv("DESTINATION_BUCKET")
+    destination_prefix = os.getenv("DESTINATION_PREFIX")
     jobs_table_name = os.getenv("JOBS_TABLE_NAME")
-    if not data_lake_bucket:
-        raise RuntimeError("DATA_LAKE_BUCKET is required")
+    if not source_bucket:
+        raise RuntimeError("SOURCE_BUCKET is required")
+    if not source_prefix:
+        raise RuntimeError("SOURCE_PREFIX is required")
+    if not destination_bucket:
+        raise RuntimeError("DESTINATION_BUCKET is required")
+    if not destination_prefix:
+        raise RuntimeError("DESTINATION_PREFIX is required")
 
     if boto3 is None:
         raise RuntimeError("boto3 is required")
@@ -226,7 +262,10 @@ def handler(event: dict, context: object) -> dict:
             _process_message(
                 s3=s3,
                 ddb=ddb,
-                data_lake_bucket=data_lake_bucket,
+                source_bucket=source_bucket,
+                source_prefix=source_prefix,
+                destination_bucket=destination_bucket,
+                destination_prefix=destination_prefix,
                 jobs_table_name=jobs_table_name,
                 defaults=defaults,
                 payload=payload,

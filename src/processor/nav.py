@@ -1,19 +1,15 @@
-"""Download BKG navigation RINEX for calibration."""
+"""Navigation file acquisition using PyTECGg downloader utilities."""
 
 from __future__ import annotations
 
-import gzip
 import re
-import shutil
-import urllib.error
-import urllib.request
 from datetime import date
 from pathlib import Path
+from typing import Callable
 
 from processor import NavFetchError
 
 BKG_BRDC_BASE_URL = "https://igs.bkg.bund.de/root_ftp/IGS/BRDC"
-USER_AGENT = "event-driven-serverless-platform-processor/1.0"
 
 
 # Keep NavDownloadError as an alias for backward compatibility
@@ -54,32 +50,17 @@ def compute_nav_doy(year: int, doy: int, offset: int) -> tuple[int, int]:
     return nav_year, nav_doy
 
 
-def _list_bkg_nav_files(year: int, doy: int, timeout: float = 30.0) -> list[str]:
-    """List navigation files from BKG directory for given year/doy."""
-    doy_str = f"{doy:03d}"
-    dir_url = f"{BKG_BRDC_BASE_URL}/{year}/{doy_str}/"
-    request = urllib.request.Request(dir_url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            html = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        raise NavFetchError(f"BKG directory not accessible: {dir_url} ({exc.code})") from exc
-    except urllib.error.URLError as exc:
-        raise NavFetchError(f"BKG directory request failed: {dir_url} ({exc.reason})") from exc
-    except TimeoutError as exc:
-        raise NavFetchError(f"BKG directory listing timed out: {dir_url}") from exc
-
-    return re.findall(r'href="([^"/]+\.gz)"', html)
-
-
 def select_bkg_nav_filename(available_files: list[str], year: int, doy: int) -> str | None:
-    """Pick the best BRDC navigation file for a given year/DOY."""
+    """Pick the best BRDC navigation file for a given year/DOY from local files."""
     doy_str = f"{doy:03d}"
     yy = str(year)[-2:]
     patterns = [
         r"^BRDC00IGS_R_.*_MN\.rnx\.gz$",
         r"^BRDC00.*_R_.*_MN\.rnx\.gz$",
         rf"^brdc{doy_str}0\.{yy}p\.gz$",
+        r"^BRDC00IGS_R_.*_MN\.rnx$",
+        r"^BRDC00.*_R_.*_MN\.rnx$",
+        rf"^brdc{doy_str}0\.{yy}p$",
     ]
     for pattern in patterns:
         for filename in available_files:
@@ -88,38 +69,37 @@ def select_bkg_nav_filename(available_files: list[str], year: int, doy: int) -> 
     return None
 
 
-def _download_file(url: str, dest: Path, timeout: float = 120.0) -> None:
-    """Download a file from url to dest with timeout enforcement."""
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    tmp_path = dest.with_suffix(dest.suffix + ".tmp")
+def _require_pytecgg_nav_downloader() -> Callable[[int, list[int], Path], None]:
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response, tmp_path.open("wb") as handle:
-            shutil.copyfileobj(response, handle)
-        tmp_path.replace(dest)
-    except urllib.error.HTTPError as exc:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        raise NavFetchError(f"BKG navigation download failed: {url} ({exc.code})") from exc
-    except urllib.error.URLError as exc:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        raise NavFetchError(f"BKG navigation download failed: {url} ({exc.reason})") from exc
-    except TimeoutError as exc:
-        if tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
-        raise NavFetchError(f"BKG navigation download timed out: {url}") from exc
+        from pytecgg.utils.download_rinex import download_nav_bkg
+    except Exception as exc:  # pragma: no cover - import guard
+        raise NavFetchError("PyTECGg nav downloader is unavailable") from exc
+    return download_nav_bkg
 
 
-def _decompress_if_needed(path: Path) -> Path:
-    """Decompress .gz file if needed, returning path to uncompressed file."""
-    if not path.name.endswith(".gz"):
-        return path
-    dest = path.with_suffix("")
-    if dest.exists() and dest.stat().st_size > 0:
-        return dest
-    with gzip.open(path, "rb") as src, dest.open("wb") as dst:
-        shutil.copyfileobj(src, dst)
-    return dest
+def _choose_downloaded_nav_file(output_dir: Path, year: int, doy: int) -> Path:
+    files = [p for p in output_dir.iterdir() if p.is_file()]
+    if not files:
+        raise NavFetchError(f"No navigation file downloaded for {year}/DOY {doy:03d}")
+
+    names = [p.name for p in files]
+    chosen_name = select_bkg_nav_filename(names, year, doy)
+    if chosen_name:
+        return output_dir / chosen_name
+
+    # Fallback: pick latest modified file if filename patterns differ upstream.
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+
+def _download_nav_for_day(nav_year: int, nav_doy: int, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    downloader = _require_pytecgg_nav_downloader()
+    try:
+        downloader(nav_year, [nav_doy], output_dir)
+    except Exception as exc:
+        raise NavFetchError(f"PyTECGg NAV download failed for {nav_year}/DOY {nav_doy:03d}") from exc
+
+    return _choose_downloaded_nav_file(output_dir, nav_year, nav_doy)
 
 
 def fetch_nav_file(
@@ -128,20 +108,18 @@ def fetch_nav_file(
     nav_day_offset: int = 1,
     timeout_list: float = 30.0,
     timeout_download: float = 120.0,
+    output_dir: Path | None = None,
 ) -> Path:
     """
-    Fetch BKG BRDC navigation file for given observation date.
-
-    Computes the navigation year/doy by subtracting nav_day_offset from the
-    observation doy (with year rollback), fetches the BKG directory listing,
-    selects a compatible navigation file, and downloads it to /tmp.
+    Fetch BKG BRDC navigation file for given observation date via PyTECGg.
 
     Args:
         year: Observation year.
         doy: Observation day of year (1-366).
         nav_day_offset: Days before observation DOY to fetch nav data (default 1).
-        timeout_list: HTTP timeout in seconds for directory listing (default 30).
-        timeout_download: HTTP timeout in seconds for file download (default 120).
+        timeout_list: Kept for backward compatibility (unused).
+        timeout_download: Kept for backward compatibility (unused).
+        output_dir: Optional destination directory for nav download cache.
 
     Returns:
         Path to downloaded navigation file in /tmp.
@@ -149,31 +127,11 @@ def fetch_nav_file(
     Raises:
         NavFetchError: on HTTP error, timeout, or no compatible file found.
     """
+    _ = timeout_list
+    _ = timeout_download
     nav_year, nav_doy = compute_nav_doy(year, doy, nav_day_offset)
-
-    # List available files from BKG directory
-    available = _list_bkg_nav_files(nav_year, nav_doy, timeout=timeout_list)
-
-    # Select the best compatible nav filename
-    filename = select_bkg_nav_filename(available, nav_year, nav_doy)
-    if not filename:
-        raise NavFetchError(
-            f"No compatible BKG navigation file for {nav_year}/DOY {nav_doy:03d}"
-        )
-
-    # Download to /tmp
-    output_dir = Path("/tmp")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dest_gz = output_dir / filename
-
-    # Skip download if file already exists with content
-    if dest_gz.exists() and dest_gz.stat().st_size > 0:
-        return _decompress_if_needed(dest_gz)
-
-    url = f"{BKG_BRDC_BASE_URL}/{nav_year}/{nav_doy:03d}/{filename}"
-    _download_file(url, dest_gz, timeout=timeout_download)
-
-    return _decompress_if_needed(dest_gz)
+    target_dir = output_dir or Path("/tmp")
+    return _download_nav_for_day(nav_year, nav_doy, target_dir)
 
 
 def download_nav_file(nav_year: int, nav_doy: int, output_dir: Path) -> Path:
@@ -182,17 +140,4 @@ def download_nav_file(nav_year: int, nav_doy: int, output_dir: Path) -> Path:
 
     This is the legacy interface kept for backward compatibility with handler.py.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    available = _list_bkg_nav_files(nav_year, nav_doy)
-    filename = select_bkg_nav_filename(available, nav_year, nav_doy)
-    if not filename:
-        raise NavFetchError(f"No compatible BKG navigation file for {nav_year}/DOY {nav_doy:03d}")
-
-    dest_gz = output_dir / filename
-    if dest_gz.exists() and dest_gz.stat().st_size > 0:
-        return _decompress_if_needed(dest_gz)
-
-    url = f"{BKG_BRDC_BASE_URL}/{nav_year}/{nav_doy:03d}/{filename}"
-    _download_file(url, dest_gz)
-
-    return _decompress_if_needed(dest_gz)
+    return _download_nav_for_day(nav_year, nav_doy, output_dir)

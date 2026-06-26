@@ -20,8 +20,8 @@ The image exists because the processor's dependency stack (PyTECGg, polars, scip
 flowchart LR
     subgraph AWS
         SQS[Process Queue<br/>SQS]
-        S3_RAW[(S3 Data Lake<br/>raw/rinexhourly/)]
-        S3_OUT[(S3 Data Lake<br/>processed/station=…)]
+        S3_RAW[(S3 Source Bucket<br/>SOURCE_PREFIX/)]
+        S3_OUT[(S3 Destination Bucket<br/>DESTINATION_PREFIX/station=…)]
         DDB[(DynamoDB<br/>Jobs Table)]
     end
 
@@ -135,12 +135,12 @@ def handler(event: dict, context: Any) -> dict:
         {"batchItemFailures": [{"itemIdentifier": messageId}, ...]}
     
     Raises:
-        RuntimeError: if DATA_LAKE_BUCKET is not set (fail-fast at entry)
+        RuntimeError: if split S3 config is not set (SOURCE_BUCKET/SOURCE_PREFIX/DESTINATION_BUCKET/DESTINATION_PREFIX)
     """
 ```
 
 Responsibilities:
-- Validate `DATA_LAKE_BUCKET` is set (fail entire invocation if missing)
+- Validate split S3 config is set (fail entire invocation if missing)
 - Iterate `event["Records"]`, normalize each payload
 - Delegate to `logic.process_record()` per record
 - Collect `batchItemFailures` from exceptions
@@ -151,7 +151,10 @@ Responsibilities:
 ```python
 def process_record(
     payload: dict,
-    bucket: str,
+    source_bucket: str,
+    source_prefix: str,
+    destination_bucket: str,
+    destination_prefix: str,
     env_params: dict,
 ) -> str:
     """
@@ -159,7 +162,10 @@ def process_record(
     
     Args:
         payload: Normalized dict with key, bucket, job_id, trace_id, parameters
-        bucket: DATA_LAKE_BUCKET value
+        source_bucket: S3 source bucket
+        source_prefix: Required input key prefix
+        destination_bucket: S3 destination bucket
+        destination_prefix: Output key prefix root
         env_params: Environment-derived defaults for processing parameters
     
     Returns:
@@ -248,7 +254,7 @@ def write_parquet(
     Write DataFrame as Snappy-compressed Parquet to S3.
     
     Returns:
-        The S3 key written: processed/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet
+        The S3 key written: {DESTINATION_PREFIX}/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet
     
     Raises:
         OutputError: on S3 put failure or schema mismatch
@@ -261,7 +267,7 @@ def build_output_key(station: str, year: int, doy: int, source_stem: str) -> str
 ### Dockerfile Design
 
 ```dockerfile
-FROM public.ecr.aws/lambda/python:3.13
+FROM python:3.13-slim
 
 # Install application package from repository root pyproject.toml
 COPY pyproject.toml requirements.lock ./
@@ -324,7 +330,7 @@ The handler normalizes three message formats into a common internal payload:
 #### Direct Processor Message
 ```json
 {
-  "key": "raw/rinexhourly/2024/150/auck1500.24o",
+  "key": "SOURCE_PREFIX/2024/150/auck1500.24o",
   "bucket": "my-data-lake",
   "job_id": "job-abc-123",
   "trace_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -342,7 +348,7 @@ The handler normalizes three message formats into a common internal payload:
     "eventSource": "aws:s3",
     "s3": {
       "bucket": {"name": "my-data-lake"},
-      "object": {"key": "raw/rinexhourly/2024/150/auck1500.24o"}
+      "object": {"key": "SOURCE_PREFIX/2024/150/auck1500.24o"}
     }
   }]
 }
@@ -380,7 +386,7 @@ class ProcessorPayload:
 ### Raw Key Structure
 
 ```
-raw/rinexhourly/{year}/{doy}/{filename}
+{SOURCE_PREFIX}/{year}/{doy}/{filename}
                   │      │      │
                   │      │      └─ e.g., "auck1500.24o"
                   │      └─ 3-digit DOY (001–366)
@@ -409,7 +415,7 @@ Parsed fields:
 | `vtec` | `float64` | Vertical TEC (TECU) |
 | `veq` | `float64` | Vertical equivalent (TECU) |
 
-Output path: `processed/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet`
+Output path: `{DESTINATION_PREFIX}/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet`
 
 ### DynamoDB Job Record
 
@@ -444,7 +450,7 @@ Output path: `processed/station={station}/year={year}/doy={doy:03d}/{source_stem
   "outcome": "success | error | skipped",
   "duration_ms": 12345,
   "row_count": 8640,
-  "output_key": "processed/station=auck/year=2024/doy=150/auck1500.parquet",
+  "output_key": "DESTINATION_PREFIX/station=auck/year=2024/doy=150/auck1500.parquet",
   "error_type": "CalibrationError",
   "error_message": "No valid TEC rows",
   "stack_trace": "Traceback (most recent call last):\n...",
@@ -471,13 +477,13 @@ Output path: `processed/station={station}/year={year}/doy={doy:03d}/{source_stem
 
 ### Property 3: Invalid Payload Rejection
 
-*For any* SQS record body that contains invalid JSON, cannot be normalized to a payload with a `key` field (and is not an S3 test event), or specifies a `bucket` that does not match `DATA_LAKE_BUCKET`, the handler SHALL include that record's `messageId` in `batchItemFailures`.
+*For any* SQS record body that contains invalid JSON, cannot be normalized to a payload with a `key` field (and is not an S3 test event), or specifies a `bucket` that does not match `SOURCE_BUCKET`, the handler SHALL include that record's `messageId` in `batchItemFailures`.
 
 **Validates: Requirements 3.10, 3.11**
 
 ### Property 4: Raw Key Parse Determinism
 
-*For any* valid raw key matching `raw/rinexhourly/{year}/{doy}/{filename}`, parsing SHALL always produce the same `(year, doy, station, source_stem)` tuple, where `station` is the first four alphabetic characters lowercased and `source_stem` is the filename without its final dot-separated extension. For any key not matching this pattern (or with invalid doy/station), parsing SHALL raise an error.
+*For any* valid raw key matching `{SOURCE_PREFIX}/{year}/{doy}/{filename}`, parsing SHALL always produce the same `(year, doy, station, source_stem)` tuple, where `station` is the first four alphabetic characters lowercased and `source_stem` is the filename without its final dot-separated extension. For any key not matching this pattern (or with invalid doy/station), parsing SHALL raise an error.
 
 **Validates: Requirements 4.1, 4.2**
 
@@ -501,13 +507,13 @@ Output path: `processed/station={station}/year={year}/doy={doy:03d}/{source_stem
 
 ### Property 8: No Output Without Calibration
 
-*For any* record where PyTECGg calibration was not successfully invoked or produced no valid rows, no file SHALL be written to the `processed/` S3 prefix for that record.
+*For any* record where PyTECGg calibration was not successfully invoked or produced no valid rows, no file SHALL be written under `DESTINATION_PREFIX` for that record.
 
 **Validates: Requirements 5.3, 9.2**
 
 ### Property 9: Output Path Determinism
 
-*For any* valid `(station, year, doy, source_stem)` tuple, the output S3 key SHALL always equal `processed/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet`, where `source_stem` is the input filename with its final dot-separated extension removed.
+*For any* valid `(station, year, doy, source_stem)` tuple and fixed destination prefix, the output S3 key SHALL always equal `{DESTINATION_PREFIX}/station={station}/year={year}/doy={doy:03d}/{source_stem}.parquet`, where `source_stem` is the input filename with its final dot-separated extension removed.
 
 **Validates: Requirements 6.1, 6.3**
 
@@ -553,7 +559,7 @@ Output path: `processed/station={station}/year={year}/doy={doy:03d}/{source_stem
 
 | Condition | Behavior | Rationale |
 |-----------|----------|-----------|
-| `DATA_LAKE_BUCKET` unset or empty | Raise `RuntimeError` at handler entry | No records can succeed without a target bucket |
+| Missing split S3 env (`SOURCE_BUCKET`, `SOURCE_PREFIX`, `DESTINATION_BUCKET`, `DESTINATION_PREFIX`) | Raise `RuntimeError` at handler entry | No records can succeed without source+destination contract |
 
 ### Per-Record Failures (Partial Batch)
 

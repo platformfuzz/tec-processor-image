@@ -1,213 +1,316 @@
 # tec-processor-image
 
-Lambda container image that calibrates GNSS RINEX observations into TEC Parquet output.
+Dual-mode Python 3.13 container image for TEC processing from GNSS RINEX observations.
 
-The processor dependency stack (PyTECGg, polars, scipy, numba, numpy, pyarrow) exceeds AWS Lambda's 250 MB zip/layer limit. Packaging as a container image (up to 10 GB) is required.
+This repository builds one OCI image that runs in:
 
-## Processing flow
+- AWS Lambda image mode (SQS/event-driven handler path), and
+- generic container mode (CLI/env-driven single-message processing).
 
-For each SQS record the handler:
+The project uses `pytecgg` as an external dependency and keeps PyTECGg integration behind thin adapters in `src/processor/`.
 
-1. Normalizes the message body (direct JSON, S3 event, or SNS-wrapped S3 event).
-2. Parses the raw object key (`raw/rinexhourly/{year}/{doy}/{station}{doy}{hour}.{yy}o`).
-3. Fetches the matching BKG BRDC navigation file for `observation_doy - NAV_DAY_OFFSET`.
-4. Runs PyTECGg calibration on the observation and navigation RINEX files.
-5. Writes Snappy-compressed Parquet to the data lake when `SAVE_PARQUET` is enabled.
-6. Optionally updates DynamoDB job status (`processing` → `completed` or `failed`).
-7. Returns partial batch failures for records that raised an exception.
+## Runtime baseline
 
-Structured JSON logs are written to stdout (one JSON object per line) with fields such as `trace_id`, `outcome`, `station`, `output_key`, and `duration_ms`.
+- Python runtime baseline: `3.13`
+- Base image: `python:3.13-slim`
+- Lambda compatibility: `awslambdaric`
+- Platform target: `linux/amd64`
+- Plot output dependencies: `matplotlib`, `plotly` (static PNG and interactive HTML formats)
 
-## Repository layout
+This repository is intentionally aligned to Python 3.13 runtime behavior and CI checks.
 
-```plaintext
-tec-processor-image/
-├── Dockerfile                 # OCI image (public.ecr.aws/lambda/python:3.13)
-├── pyproject.toml             # Package metadata and dependency constraints
-├── requirements.lock          # Pinned versions for reproducible container installs
-├── src/processor/
-│   ├── handler.py             # Lambda entry point (CMD: processor.handler.handler)
-│   ├── logic.py               # Key parsing, payload normalization, orchestration
-│   ├── nav.py                 # BKG BRDC navigation file download
-│   ├── calibration.py         # PyTECGg wrapper
-│   ├── parquet_io.py          # Parquet encoding and S3 write helpers
-│   └── logging.py             # Structured logging utilities
-├── tests/                     # Unit and property tests (pytest + hypothesis)
-└── .github/workflows/
-    ├── ci.yml                 # PR checks via actionsforge reusables
-    └── release.yml            # GHCR publish on main and semver tags
-```
+## Quick start
 
-## Runtime
-
-| Item | Value |
-| --- | --- |
-| Base image | `public.ecr.aws/lambda/python:3.13` |
-| Handler | `processor.handler.handler` |
-| Python | 3.13 (PyTECGg has no `cp314` wheels yet; see [Python 3.14 gate](#python-314-gate)) |
-| Platform | `linux/amd64` |
-
-### Environment variables
-
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `DATA_LAKE_BUCKET` | yes | — | S3 bucket for raw RINEX input and processed Parquet output |
-| `JOBS_TABLE_NAME` | no | — | DynamoDB table for job status updates (`job_id` partition key) |
-| `NAV_DAY_OFFSET` | no | `1` | Days before observation DOY to fetch navigation data |
-| `SAVE_PARQUET` | no | `true` | Write calibrated rows as Parquet (required output format today) |
-| `SAVE_CSV` | no | `false` | Not supported in Lambda image (raises if enabled without Parquet) |
-| `SAVE_STATIC_PLOTS` | no | `false` | Not supported in Lambda image |
-| `SAVE_INTERACTIVE_PLOTS` | no | `false` | Not supported in Lambda image |
-
-Per-message `parameters` in the SQS body override the env defaults for the keys above.
-
-### IAM permissions
-
-The Lambda execution role needs at minimum:
-
-- `s3:GetObject` on `raw/rinexhourly/*` keys in the data lake bucket
-- `s3:PutObject` on `processed/station=*/*` keys in the data lake bucket
-- `dynamodb:UpdateItem` on the jobs table (when `JOBS_TABLE_NAME` is set)
-- Outbound HTTPS to `igs.bkg.bund.de` for navigation file download
-
-`boto3` is provided by the AWS Lambda runtime and is not bundled as an application dependency.
-
-## Data contract
-
-### Input object key
-
-Raw RINEX files must use this key pattern:
-
-```plaintext
-raw/rinexhourly/{year}/{doy}/{station}{doy}{hour}.{yy}o
-```
-
-Example: `raw/rinexhourly/2024/150/auck1500.24o` (station `auck`, year 2024, DOY 150).
-
-### Output object key
-
-```plaintext
-processed/station={station}/year={year}/doy={doy}/{source_stem}.parquet
-```
-
-Example: `processed/station=auck/year=2024/doy=150/auck1500.parquet`
-
-### Parquet schema
-
-Eleven columns, Snappy compression, UTC `epoch` timestamps:
-
-`epoch`, `sv`, `id_arc`, `lat_ipp`, `lon_ipp`, `azi`, `ele`, `bias`, `stec`, `vtec`, `veq`
-
-### SQS message formats
-
-The handler accepts three body shapes:
-
-**Direct processor message** (optional fields shown):
-
-```json
-{
-  "key": "raw/rinexhourly/2024/150/auck1500.24o",
-  "job_id": "optional-uuid",
-  "trace_id": "optional-trace",
-  "parameters": {
-    "NAV_DAY_OFFSET": 1,
-    "SAVE_PARQUET": true
-  }
-}
-```
-
-**S3 event notification** — standard `Records[0].s3` structure; `bucket` and URL-decoded `key` are extracted.
-
-**SNS-wrapped S3 event** — SNS envelope with JSON `Message` containing the S3 event.
-
-S3 `TestEvent` messages are acknowledged and skipped (`outcome: skipped`).
-
-The full platform data contract (including upstream ingest schemas) lives in the monorepo at `event-driven-serverless-platform-demo/docs/DATA_CONTRACT.md`.
-
-## Dependencies
-
-Direct dependencies (`pyproject.toml`):
-
-- `pytecgg >= 1.3.0` (Python `< 3.14`)
-- `pyarrow >= 23.0.1`
-- `polars >= 1.5.0`
-
-PyTECGg transitively installs `numpy`, `scipy`, `numba`, `llvmlite`, `pymap3d`, `ppigrf`, `pandas`, `requests`, and others. Exact container versions are pinned in `requirements.lock`.
-
-### Regenerating `requirements.lock`
-
-Resolve on the Lambda base image so wheels match production:
-
-```bash
-docker run --rm --entrypoint bash public.ecr.aws/lambda/python:3.13 -c \
-  'pip install --no-cache-dir "pytecgg==1.3.0" "pyarrow==23.0.1" "polars==1.18.0" && pip freeze'
-```
-
-Copy the installed packages into `requirements.lock` (exclude `boto3`, `botocore`, and other Lambda-runtime packages).
-
-## Local development
-
-Requires Python 3.11–3.13 (`requires-python = ">=3.11,<3.14"`).
+### 1) Install for local development
 
 ```bash
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
-pytest tests/ -v
-ruff check src/ tests/
 ```
 
-On a Python 3.14 host, local installs may require `pip install --ignore-requires-python -e ".[dev]"` for validation only; CI and the container image target 3.13.
+### 2) Run local tests
 
-## Build image
+```bash
+# Default offline suite (same marker policy as CI)
+pytest tests/ -v -m "not integration_geonet"
+
+# Optional live networked integration tests
+RUN_GEONET_INTEGRATION=1 pytest tests/ -v -m integration_geonet
+```
+
+### 3) Build the image
 
 ```bash
 docker build -t tec-processor-image .
 ```
 
-The image installs from `requirements.lock`, copies `src/` into `${LAMBDA_TASK_ROOT}`, and sets `CMD ["processor.handler.handler"]`.
+## What the processor does
+
+For each logical message, the processor:
+
+1. Normalizes the payload body (direct JSON, S3 event, or SNS-wrapped S3 event).
+2. Validates that the input key is under `SOURCE_PREFIX`, then parses year/doy/station from the key.
+3. Resolves nav date via `NAV_DAY_OFFSET` and downloads BRDC nav through PyTECGg downloader APIs.
+4. Runs PyTECGg calibration and serializes rows into all enabled output formats.
+5. Writes each enabled output to `DESTINATION_BUCKET` under `DESTINATION_PREFIX` and returns per-record failures where applicable.
+6. Optionally updates job status in DynamoDB when `JOBS_TABLE_NAME` and `job_id` are provided.
+
+Multiple output format flags may be enabled simultaneously. All outputs share the same destination partition path and differ only by file extension.
+
+Lambda remains input-driven. Runtime code does not perform local sample discovery.
+
+## Runtime modes
+
+Entrypoint is `python -m processor.main`.
+
+- `PROCESSOR_MODE=lambda` (default)  
+  Starts Lambda Runtime Interface Client with handler `processor.handler.handler`.
+- `PROCESSOR_MODE=container`  
+  Processes one payload from `--event-json`, `--event-file`, or stdin.
+- `PROCESSOR_MODE=shell`  
+  Opens a shell only when `ENABLE_DEBUG_SHELL=true`.
+
+### Container mode: end-to-end with S3 write
+
+Container mode needs AWS credentials when reading from private buckets or writing outputs. Mount your local AWS config and pass the profile into the container:
+
+```bash
+export AWS_PROFILE=your-profile
+export AWS_REGION=ap-southeast-2
+
+docker run --rm \
+  -e PROCESSOR_MODE=container \
+  -e AWS_REGION="$AWS_REGION" \
+  -e AWS_PROFILE="$AWS_PROFILE" \
+  -e AWS_SDK_LOAD_CONFIG=1 \
+  -e SOURCE_BUCKET=geonet-open-data \
+  -e SOURCE_PREFIX=gnss/rinexhourly \
+  -e DESTINATION_BUCKET=your-destination-bucket \
+  -e DESTINATION_PREFIX=processed/tec \
+  -e SAVE_PARQUET=true \
+  -e SAVE_CSV=true \
+  -e SAVE_JSON=true \
+  -e SAVE_STATIC_PLOTS=true \
+  -e SAVE_INTERACTIVE_PLOTS=true \
+  -v "$HOME/.aws:/root/.aws" \
+  tec-processor-image \
+  --event-json '{"key":"gnss/rinexhourly/2026/175/AUKT00NZL_R_20261750000_01H_30S_MO.rnx.gz"}'
+```
+
+On success the container prints JSON to stdout, for example:
+
+```json
+{"outcome":"success","output_key":"processed/tec/station=aukt/year=2026/doy=175/AUKT00NZL_R_20261750000_01H_30S_MO.rnx.parquet","s3_write_performed":true}
+```
+
+`output_key` is the primary output (first enabled format by priority: Parquet, then CSV, JSON, static plot, interactive plot). When multiple flags are enabled, all formats are written under the same partition path with different extensions.
+
+Verify all five objects:
+
+```bash
+aws s3 ls "s3://your-destination-bucket/processed/tec/station=aukt/year=2026/doy=175/"
+```
+
+Expected files for the example key above:
+
+- `AUKT00NZL_R_20261750000_01H_30S_MO.rnx.parquet`
+- `AUKT00NZL_R_20261750000_01H_30S_MO.rnx.csv`
+- `AUKT00NZL_R_20261750000_01H_30S_MO.rnx.json`
+- `AUKT00NZL_R_20261750000_01H_30S_MO.rnx.png`
+- `AUKT00NZL_R_20261750000_01H_30S_MO.rnx.html`
+
+Use a key that already exists in your configured `SOURCE_BUCKET` and matches `SOURCE_PREFIX`.
+
+#### Credentials in container mode
+
+- Mount `~/.aws` read-write (`-v "$HOME/.aws:/root/.aws"`) so SSO cache refresh works.
+- Pass `AWS_PROFILE` and `AWS_SDK_LOAD_CONFIG=1` into the container — the host `AWS_PROFILE` is not inherited automatically.
+- Do **not** set `CONTAINER_PUBLIC_S3_READ=true` when writing to a private destination bucket. That flag forces an unsigned S3 client for reads, and the same client is used for `put_object`, which causes `AccessDenied` on writes.
+
+Optional: create a temporary writable destination bucket for testing, then force-delete it when done (including contents):
+
+```bash
+# Set your region and a globally unique bucket name
+export AWS_REGION=ap-southeast-2
+export TEST_BUCKET="tec-processor-test-$(date +%s)"
+
+# Create bucket (non-versioned test bucket)
+aws s3api create-bucket \
+  --bucket "$TEST_BUCKET" \
+  --region "$AWS_REGION" \
+  --create-bucket-configuration LocationConstraint="$AWS_REGION"
+
+# ...run tests using DESTINATION_BUCKET=$TEST_BUCKET...
+
+# Force delete bucket and all objects inside it
+aws s3 rb "s3://$TEST_BUCKET" --force
+```
+
+### Container mode: process-only test (no output write)
+
+For public GeoNet testing where you only want to verify processing:
+
+```bash
+docker run --rm \
+  -e PROCESSOR_MODE=container \
+  -e SOURCE_BUCKET=geonet-open-data \
+  -e SOURCE_PREFIX=gnss/rinexhourly \
+  -e DESTINATION_BUCKET=my-processed-bucket \
+  -e DESTINATION_PREFIX=processed/tec \
+  -e CONTAINER_PUBLIC_S3_READ=true \
+  -e CONTAINER_SKIP_S3_WRITE=true \
+  tec-processor-image \
+  --event-json '{"key":"gnss/rinexhourly/2026/175/AUKT00NZL_R_20261750000_01H_30S_MO.rnx.gz"}'
+```
+
+`CONTAINER_PUBLIC_S3_READ=true` uses unsigned S3 reads for public buckets (GeoNet open data). Use only with `CONTAINER_SKIP_S3_WRITE=true` — unsigned clients cannot write to private buckets.
+
+`CONTAINER_SKIP_S3_WRITE=true` skips all S3 output writes while still running parse, nav fetch, calibration, and serialization for every enabled format.
+
+### Debug shell gate example
+
+```bash
+docker run --rm -it \
+  -e PROCESSOR_MODE=shell \
+  -e ENABLE_DEBUG_SHELL=true \
+  tec-processor-image
+```
+
+## Environment variables
+
+| Variable | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `SOURCE_BUCKET` | yes | — | S3 bucket for raw input objects |
+| `SOURCE_PREFIX` | yes | — | Required key prefix for raw inputs (e.g. `raw/rinexhourly`) |
+| `DESTINATION_BUCKET` | yes | — | S3 bucket for output objects |
+| `DESTINATION_PREFIX` | yes | — | Prefix root for output objects (e.g. `processed/tec`) |
+| `JOBS_TABLE_NAME` | no | — | DynamoDB table for job status |
+| `NAV_DAY_OFFSET` | no | `1` | Navigation day offset |
+| `SAVE_PARQUET` | no | `true` | Write Snappy-compressed `.parquet` output |
+| `SAVE_CSV` | no | `false` | Write UTF-8 `.csv` output |
+| `SAVE_JSON` | no | `false` | Write `.json` output (JSON array of TEC rows) |
+| `SAVE_STATIC_PLOTS` | no | `false` | Write `.png` static TEC plot |
+| `SAVE_INTERACTIVE_PLOTS` | no | `false` | Write `.html` interactive TEC plot (Plotly CDN) |
+| `PROCESSOR_MODE` | no | `lambda` | Runtime mode selector |
+| `CONTAINER_PUBLIC_S3_READ` | no | `false` | Unsigned S3 reads for public buckets (container mode only; incompatible with writes) |
+| `CONTAINER_SKIP_S3_WRITE` | no | `false` | Skip S3 output writes after processing (container mode only) |
+| `ENABLE_DEBUG_SHELL` | no | `false` | Enables shell mode access |
+| `DEBUG_SHELL_PATH` | no | `/bin/bash` | Shell binary path in shell mode |
+
+At least one output flag must be `true`. Multiple flags may be enabled simultaneously — all enabled formats are written in the same processing run to the same destination partition.
+
+Per-message `parameters` can override processing flags such as `NAV_DAY_OFFSET` and `SAVE_PARQUET`.
+
+## Data contract
+
+### Input key format
+
+Input `key` must start with `SOURCE_PREFIX/` and include:
+
+```text
+{source_prefix}/{year}/{doy}/{filename}
+```
+
+Example:
+
+`raw/rinexhourly/2024/150/auck1500.24o` (when `SOURCE_PREFIX=raw/rinexhourly`)
+
+### Output key format
+
+All enabled output formats share the same partition path and differ only by extension:
+
+```text
+{destination_prefix}/station={station}/year={year}/doy={doy}/{source_stem}.{ext}
+```
+
+| Format | Extension | Content type |
+| --- | --- | --- |
+| Parquet | `.parquet` | `application/vnd.apache.parquet` |
+| CSV | `.csv` | `text/csv` |
+| JSON | `.json` | `application/json` |
+| Static plot | `.png` | `image/png` |
+| Interactive plot | `.html` | `text/html` |
+
+Example (Parquet, `DESTINATION_PREFIX=processed/tec`):
+
+`processed/tec/station=auck/year=2024/doy=150/auck1500.parquet`
+
+### Output schema
+
+All data formats (Parquet, CSV, JSON) contain 11 columns/fields:
+
+`epoch`, `sv`, `id_arc`, `lat_ipp`, `lon_ipp`, `azi`, `ele`, `bias`, `stec`, `vtec`, `veq`
+
+### Accepted SQS body shapes
+
+- Direct processor payload (`key`, optional `job_id`, `trace_id`, `parameters`)
+- Standard S3 event notification (`Records[0].s3`)
+- SNS-wrapped S3 event (`Message` containing S3 event JSON)
+
+S3 `TestEvent` bodies are acknowledged and skipped.
+
+## Local GeoNet tooling (non-runtime)
+
+Local sample helpers live under `tools/` and are not imported by Lambda runtime paths.
+
+```bash
+# Download one fixed AUCK hourly sample candidate
+python -m tools.geonet_samples --output-dir .tmp/geonet-samples
+
+# Run local sample -> nav download -> calibration -> parquet output
+python -m tools.local_geonet_runner --output-dir .tmp/local-geonet-run --nav-day-offset 1
+```
+
+## Repository layout
+
+```text
+tec-processor-image/
+├── Dockerfile
+├── pyproject.toml
+├── requirements.lock
+├── src/processor/
+│   ├── handler.py
+│   ├── logic.py
+│   ├── nav.py
+│   ├── calibration.py
+│   ├── parquet_io.py
+│   ├── csv_io.py
+│   ├── json_io.py
+│   ├── plot_io.py
+│   ├── logging.py
+│   └── main.py
+├── tools/
+│   ├── geonet_samples.py
+│   └── local_geonet_runner.py
+├── tests/
+└── .github/workflows/
+```
 
 ## CI/CD
 
-### Pull requests (`.github/workflows/ci.yml`)
+### Pull request checks
 
-Calls [`actionsforge/actions`](https://github.com/actionsforge/actions) reusable `python-image-pr-checks.yml`:
+`/.github/workflows/ci.yml` runs reusable checks with:
 
-- Markdown lint and commit message conformance
-- Python 3.13 lint and test (`pytest tests/ -v`)
-- Docker build validation with Trivy (`trivy-vuln-type: library` — scans application dependencies only; OS packages in the AWS Lambda base image are AWS-managed)
+- Python `3.13`
+- `pytest tests/ -v -m "not integration_geonet"`
+- Trivy library dependency scanning
 
-### Release (`.github/workflows/release.yml`)
+### Release
 
-Publishes to GHCR on pushes to `main`, semver tags (`v*`), and `workflow_dispatch`. Markdown-only changes do not trigger a release (`paths-ignore`).
+`/.github/workflows/release.yml` publishes images to GHCR on `main`, semver tags, and manual dispatch.
 
-Tags produced by `docker/metadata-action`:
+Image reference format:
 
-| Trigger | Example tag |
-| --- | --- |
-| `main` branch | `latest`, `sha-<full-commit>` |
-| Semver tag `v1.2.3` | `1.2.3` |
+`ghcr.io/<owner>/tec-processor-image:<tag>`
 
-Image reference: `ghcr.io/<owner>/tec-processor-image:<tag>` (owner/repo lowercased).
+## Deploy-time GHCR -> ECR promotion
 
-```bash
-docker pull ghcr.io/platformfuzz/tec-processor-image:latest
-```
-
-Trivy runs before push and fails on `CRITICAL` findings.
-
-## Deploy-time promotion to ECR
-
-AWS Lambda `package_type = Image` requires an ECR image URI. Promote from GHCR at deploy time:
-
-### ECR prerequisites
+Lambda `package_type = Image` requires ECR image URIs.
 
 ```bash
 aws ecr create-repository --repository-name tec-processor-image --region <region>
-```
 
-### Promote GHCR → ECR
-
-```bash
 docker pull ghcr.io/platformfuzz/tec-processor-image:<tag>
 docker tag ghcr.io/platformfuzz/tec-processor-image:<tag> \
   <account>.dkr.ecr.<region>.amazonaws.com/tec-processor-image:<tag>
@@ -216,34 +319,22 @@ aws ecr get-login-password --region <region> \
 docker push <account>.dkr.ecr.<region>.amazonaws.com/tec-processor-image:<tag>
 ```
 
-### Update Terraform
+## Lambda smoke test
 
-Point the monorepo `processor_image_uri` variable at the promoted ECR URI:
-
-```bash
-terraform apply \
-  -var="processor_image_uri=123456789012.dkr.ecr.us-east-1.amazonaws.com/tec-processor-image:1.2.3"
-```
-
-## Smoke test
-
-After deployment:
-
-1. Ensure a valid RINEX file exists in the data lake at the key referenced in the payload.
-2. Create `event.json`:
+Create `event.json`:
 
 ```json
 {
   "Records": [
     {
       "messageId": "smoke-test-001",
-      "body": "{\"key\": \"raw/rinexhourly/2024/150/auck1500.24o\"}"
+      "body": "{\"key\":\"raw/rinexhourly/2024/150/auck1500.24o\"}"
     }
   ]
 }
 ```
 
-3. Invoke the Lambda:
+Invoke:
 
 ```bash
 aws lambda invoke \
@@ -254,18 +345,14 @@ aws lambda invoke \
 cat response.json
 ```
 
-4. Expected success — empty partial failure list:
+Expected success:
 
 ```json
-{"batchItemFailures": []}
+{"batchItemFailures":[]}
 ```
-
-If `batchItemFailures` is non-empty, check CloudWatch logs for structured entries with `"outcome": "error"`.
-
-## Python 3.14 gate
-
-PyTECGg currently publishes wheels for Python 3.11–3.13 only. This repository targets CPython 3.13 until `cp314` wheels are available on PyPI. Tracking details are in `.kiro/specs/tec-processor-image/requirements.md` (Requirement 16) and `pyproject.toml`.
 
 ## Specification
 
-Design, requirements, and implementation tasks for this repository are maintained under `.kiro/specs/tec-processor-image/`.
+Kiro specification artifacts are under `.kiro/specs/tec-processor-image/`.
+
+Requirements-first mode is configured via `.kiro/specs/tec-processor-image/.config.kiro`.

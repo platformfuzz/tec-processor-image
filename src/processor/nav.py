@@ -1,17 +1,28 @@
+<<<<<<< HEAD
 """Navigation file acquisition using PyTECGg downloader utilities."""
+=======
+"""Navigation file resolution using PyTECGg download utilities."""
+>>>>>>> 4fab63a (fix: delegate nav download to pytecgg)
 
 from __future__ import annotations
 
 import re
+<<<<<<< HEAD
+=======
+import shutil
+>>>>>>> 4fab63a (fix: delegate nav download to pytecgg)
 from datetime import date
 from pathlib import Path
 from typing import Callable
 
 from processor import NavFetchError
 
+<<<<<<< HEAD
 BKG_BRDC_BASE_URL = "https://igs.bkg.bund.de/root_ftp/IGS/BRDC"
 
 
+=======
+>>>>>>> 4fab63a (fix: delegate nav download to pytecgg)
 # Keep NavDownloadError as an alias for backward compatibility
 NavDownloadError = NavFetchError
 
@@ -69,12 +80,19 @@ def select_bkg_nav_filename(available_files: list[str], year: int, doy: int) -> 
     return None
 
 
+<<<<<<< HEAD
 def _require_pytecgg_nav_downloader() -> Callable[[int, list[int], Path], None]:
     try:
         from pytecgg.utils.download_rinex import download_nav_bkg
     except Exception as exc:  # pragma: no cover - import guard
         raise NavFetchError("PyTECGg nav downloader is unavailable") from exc
     return download_nav_bkg
+=======
+def _pytecgg_download_nav_bkg(year: int, doys: list[int], output_dir: Path) -> None:
+    from pytecgg.utils.download_rinex import download_nav_bkg
+
+    download_nav_bkg(year, doys, output_dir)
+>>>>>>> 4fab63a (fix: delegate nav download to pytecgg)
 
 
 def _choose_downloaded_nav_file(output_dir: Path, year: int, doy: int) -> Path:
@@ -127,11 +145,17 @@ def fetch_nav_file(
     Raises:
         NavFetchError: on HTTP error, timeout, or no compatible file found.
     """
+<<<<<<< HEAD
     _ = timeout_list
     _ = timeout_download
     nav_year, nav_doy = compute_nav_doy(year, doy, nav_day_offset)
     target_dir = output_dir or Path("/tmp")
     return _download_nav_for_day(nav_year, nav_doy, target_dir)
+=======
+    del timeout_list, timeout_download
+    nav_year, nav_doy = compute_nav_doy(year, doy, nav_day_offset)
+    return download_nav_file(nav_year, nav_doy, Path("/tmp"))
+>>>>>>> 4fab63a (fix: delegate nav download to pytecgg)
 
 
 def download_nav_file(nav_year: int, nav_doy: int, output_dir: Path) -> Path:
@@ -140,4 +164,26 @@ def download_nav_file(nav_year: int, nav_doy: int, output_dir: Path) -> Path:
 
     This is the legacy interface kept for backward compatibility with handler.py.
     """
+<<<<<<< HEAD
     return _download_nav_for_day(nav_year, nav_doy, output_dir)
+=======
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _pytecgg_download_nav_bkg(nav_year, [nav_doy], output_dir)
+    except Exception as exc:
+        raise NavFetchError(
+            f"PyTECGg nav download failed for {nav_year}/DOY {nav_doy:03d}: {exc}"
+        ) from exc
+
+    available = [file.name for file in output_dir.glob("*.gz")]
+    filename = select_bkg_nav_filename(available, nav_year, nav_doy)
+    if not filename:
+        raise NavFetchError(f"No compatible BKG navigation file for {nav_year}/DOY {nav_doy:03d}")
+
+    dest_gz = output_dir / filename
+    if not dest_gz.exists() or dest_gz.stat().st_size == 0:
+        raise NavFetchError(f"PyTECGg did not produce a usable nav file for {nav_year}/DOY {nav_doy:03d}")
+
+    return _decompress_if_needed(dest_gz)
+>>>>>>> 4fab63a (fix: delegate nav download to pytecgg)

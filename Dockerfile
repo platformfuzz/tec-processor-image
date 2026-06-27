@@ -10,6 +10,7 @@ WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates \
+    && apt-get purge -y --allow-remove-essential perl-base \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml requirements.lock ./

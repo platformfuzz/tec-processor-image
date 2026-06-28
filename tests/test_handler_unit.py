@@ -158,7 +158,7 @@ def test_processor_handler_reports_partial_failures(monkeypatch):
             },
             {
                 "messageId": "bad-1",
-                "body": json.dumps({"key": "raw/rinexhourly/2024/150/12341500.24o"}),
+                "body": json.dumps({"key": "raw/rinexhourly/2024/150/12@41500.24o"}),
             },
         ]
     }

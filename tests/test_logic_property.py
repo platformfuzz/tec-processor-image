@@ -8,6 +8,7 @@ from urllib.parse import quote_plus
 
 import pytest
 from hypothesis import given, settings
+from hypothesis import HealthCheck
 from hypothesis import strategies as st
 
 from processor.logic import (
@@ -31,7 +32,7 @@ DESTINATION_PREFIX = "processed/tec"
 
 # --- Hypothesis strategies for Property 4: Raw Key Parse Determinism ---
 
-_alpha_station = st.text(alphabet=string.ascii_lowercase, min_size=4, max_size=4)
+_alnum_station = st.text(alphabet=string.ascii_lowercase + string.digits, min_size=4, max_size=4)
 _alphanumeric_suffix = st.text(
     alphabet=string.ascii_lowercase + string.digits, min_size=0, max_size=12
 )
@@ -45,7 +46,7 @@ def valid_raw_keys(draw):
     """Generate valid raw keys matching raw/rinexhourly/{year}/{doy}/{filename}."""
     year = draw(_year)
     doy = draw(_doy)
-    station = draw(_alpha_station)
+    station = draw(_alnum_station)
     suffix = draw(_alphanumeric_suffix)
     ext = draw(_extension)
     filename = f"{station}{suffix}.{ext}"
@@ -63,27 +64,28 @@ def invalid_raw_keys(draw):
         # Missing components (no rinexhourly prefix)
         year = draw(_year)
         doy = draw(_doy)
-        filename = draw(_alpha_station) + "1500.24o"
+        filename = draw(_alnum_station) + "1500.24o"
         return f"raw/other/{year}/{doy:03d}/{filename}"
     elif case == 1:
         # Invalid doy > 366
         year = draw(_year)
         doy = draw(st.integers(min_value=367, max_value=999))
-        station = draw(_alpha_station)
+        station = draw(_alnum_station)
         return f"raw/rinexhourly/{year}/{doy:03d}/{station}1500.24o"
     elif case == 2:
-        # Non-alpha station prefix (digits at start)
+        # Invalid station prefix (contains symbols)
         year = draw(_year)
         doy = draw(_doy)
-        digit_prefix = draw(st.text(alphabet=string.digits, min_size=4, max_size=4))
-        return f"raw/rinexhourly/{year}/{doy:03d}/{digit_prefix}1500.24o"
+        symbol_prefix = draw(st.text(alphabet="!@#$%^&*()", min_size=1, max_size=1))
+        return f"raw/rinexhourly/{year}/{doy:03d}/12A{symbol_prefix}1500.24o"
     elif case == 3:
-        # Station prefix too short (< 4 alpha chars before non-alpha)
+        # Station prefix invalid (symbol injected within first four chars)
         year = draw(_year)
         doy = draw(_doy)
         short_station = draw(st.text(alphabet=string.ascii_lowercase, min_size=1, max_size=3))
-        digit_part = draw(st.text(alphabet=string.digits, min_size=1, max_size=4))
-        return f"raw/rinexhourly/{year}/{doy:03d}/{short_station}{digit_part}.24o"
+        symbol = draw(st.text(alphabet="!@#$%^&*()", min_size=1, max_size=1))
+        padding = draw(st.text(alphabet=string.ascii_lowercase + string.digits, min_size=0, max_size=4))
+        return f"raw/rinexhourly/{year}/{doy:03d}/{short_station}{symbol}{padding}.24o"
     else:
         # Completely wrong format
         return draw(st.text(min_size=1, max_size=50))
@@ -117,7 +119,7 @@ class TestRawKeyParseDeterminism:
         assert station == expected_station
         assert source_stem == expected_stem
 
-    @settings(max_examples=100)
+    @settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
     @given(key=invalid_raw_keys())
     def test_invalid_key_raises_error(self, key):
         """For any key not matching the valid pattern, parse_raw_key raises ValueError."""

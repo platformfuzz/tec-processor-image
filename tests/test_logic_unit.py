@@ -15,12 +15,19 @@ def test_parse_raw_key_valid_geonet_prefix():
     assert (year, doy, station, stem) == (2026, 175, "aukt", "AUKT00NZL_R_20261750000_01H_30S_MO.rnx")
 
 
+def test_parse_raw_key_valid_numeric_station_prefix():
+    year, doy, station, stem = parse_raw_key(
+        "raw/rinexhourly/2026/178/240600NZL_R_20261780000_01H_30S_MO.rnx.gz"
+    )
+    assert (year, doy, station, stem) == (2026, 178, "2406", "240600NZL_R_20261780000_01H_30S_MO.rnx")
+
+
 @pytest.mark.parametrize(
     "bad_key",
     [
         "raw/rinexhourly/2024/15/auck1500.24o",
         "raw/rinexhourly/2024/400/auck1500.24o",
-        "raw/rinexhourly/2024/150/12341500.24o",
+        "raw/rinexhourly/2024/150/12@41500.24o",
         "raw/rinexhourly/2024/150",
     ],
 )

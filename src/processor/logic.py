@@ -69,7 +69,7 @@ def parse_raw_key(key: str) -> tuple[int, int, str, str]:
     filename = match.group("filename")
     source_stem = filename.rsplit(".", 1)[0]
     station = source_stem[:4]
-    if len(station) != 4 or not station.isalpha():
+    if len(station) != 4 or not station.isalnum():
         raise ValueError(f"Invalid station extracted from filename: {filename}")
 
     return year, doy, station.lower(), source_stem
